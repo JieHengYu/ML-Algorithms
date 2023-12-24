@@ -1,0 +1,283 @@
+---
+title: "Building Your First Random Forest Model"
+author: "Jie Heng Yu"
+date: "2/17/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(parallel)
+library(parallelMap)
+```
+
+```{r, warning = FALSE, message = FALSE, include = FALSE}
+data(Zoo, package = 'mlbench')
+zooTib <- mutate_if(as_tibble(Zoo), is.logical, as.factor)
+
+zooTask <- makeClassifTask(data = zooTib, target = 'type')
+tree <- makeLearner('classif.rpart')
+
+treeParamSpace <- makeParamSet(
+  makeIntegerParam('minsplit', lower = 5, upper = 20),
+  makeIntegerParam('minbucket', lower = 3, upper = 10),
+  makeNumericParam('cp', lower = 0.01, upper = 0.1),
+  makeIntegerParam('maxdepth', lower = 3, upper = 10)
+)
+
+randSearch <- makeTuneControlRandom(maxit = 200)
+cvForTuning <- makeResampleDesc('CV', iters = 5)
+
+parallelStartSocket(cpus = detectCores())
+tunedTreePars <- tuneParams(tree, task = zooTask, resampling = cvForTuning,
+                            par.set = treeParamSpace, control = randSearch)
+tunedTree <- setHyperPars(tree, par.vals = tunedTreePars$x)
+tunedTreeModel <- train(tunedTree, zooTask)
+treeModelData <- getLearnerModel(tunedTreeModel)
+
+outer <- makeResampleDesc('CV', iters = 5)
+treeWrapper <- makeTuneWrapper('classif.rpart', resampling = cvForTuning,
+                               par.set = treeParamSpace, control = randSearch)
+cvWithTuning <- resample(treeWrapper, zooTask, resampling = outer)
+parallelStop()
+```
+
+
+# Building Your First Random Forest Model
+
+We'll be building a random forest model (using bootstrapping to train many trees & aggregating their predictions) & how to tune its hyperparameters. There are four important hyperparameters for us to consider:
+
+* *ntree* - The number of individual trees in the forest
+* *mtry* - The number of features to randomly sample at each node
+* *nodesize* - The minimum number of cases allowed in a leaf (the same as *minbucket* in rpart)
+* *maxnodes* - The maximum number of leaves allowed
+
+Because we're aggregating the votes of many trees in random forest, the more trees we have, the better. There is no downside to having more trees aside from computational cost: at some point, we get diminishing returns. Rather than tuning this value, we'll fix it to a number of trees we know fits our computational budget, generally several hundred to the low thousands. We'll go over how to tell if we used enough trees, or if we can reduce our tree number to speed up training times.
+
+The other three hyperparameters -- *mtry*, *nodesize*, & *maxnodes* -- will need tuning. We'll continue with our `zooTask` that we defined in our previous lessons. The first thing to do is to create a learner with the `makeLearner()` function. This time, our learner is `'classif.randomForest'`.
+
+```{r}
+forest <- makeLearner('classif.randomForest')
+forest
+```
+
+Next, we'll create the hyperparameter space we're going to tune over. We'll fix the number of trees at 300, so we simply specify `lower = 300` & `upper = 300` in its `makeIntegerParam()` call. We have 16 predictor variables in our data set, so we'll search for an optimal value of *mtry* between 6 & 12. Because some of our groups are very small, we'll need to allow our leaves to have a small number of cases in them, so we'll tune *nodesize* between 1 & 5. Finally, we don't want to constrain the tree size too much, so we'll search for a *maxnodes* value between 5 & 20.
+
+```{r, message = FALSE}
+forestParamSpace <- makeParamSet(
+  makeIntegerParam('ntree', lower = 300, upper = 300),
+  makeIntegerParam('mtry', lower = 6, upper = 12),
+  makeIntegerParam('nodesize', lower = 1, upper = 5),
+  makeIntegerParam('maxnodes', lower = 5, upper = 20)
+)
+
+randSearch <- makeTuneControlRandom(maxit = 100)
+
+cvForTuning <- makeResampleDesc('CV', iter = 5)
+
+parallelStartSocket(cpus = detectCores())
+tunedForestPars <- tuneParams(forest, task = zooTask, resampling = cvForTuning,
+                              par.set = forestParamSpace, control = randSearch)
+parallelStop()
+
+tunedForestPars
+```
+
+Now, let's train a final model by using `setHyperPars()` to make a learner with our tuned hyperparameters, & then pass it to the `train()` function.
+
+```{r}
+tunedForest <- setHyperPars(forest, par.vals = tunedForestPars$x)
+tunedForestModel <- train(tunedForest, zooTask)
+tunedForestModel
+```
+
+How do we know if we've included enough trees in our forest? We can plot the mean *out-of-bag* error against the tree number. When building a random forest, remember that we take a bootstrap sample of cases for each tree. The out-of-bag error is the mean prediction error for each case, by trees that *did not* include that case in their bootstrap. Out-of-bag error estimation is specific to algorithms that use bagging & allows us to estimate the performance of the forest it grows.
+
+The first thing we need to do is extract the model information using the `getLearnerModel()` function. Then we can simply call `plot()` on this model data object (specifying what colours & linetypes to use for each class). Let's add a legend using the `legend()` function so we know what we're looking at.
+
+```{r}
+forestModelData <- getLearnerModel(tunedForestModel)
+
+species <- colnames(forestModelData$err.rate)
+
+plot(forestModelData, col = 1:length(species), lty = 1:length(species))
+
+legend("topright", species,
+       col = 1:length(species),
+       lty = 1:length(species))
+```
+
+The resulting plot shows the mean out-of-bag error for each class (separate lines & a line for the mean) against different numbers of trees in the forest. We can see that once we have at least 100 trees in our forest, our error estimate stabilises. This indicates that we have anough trees in our forest (& could even use fewer). If we train a model & the mean out-of-bag error doesn't stabilise, we should add more trees.
+
+We're happy there are enoguh trees in our forest. So now, lets properly cross-validate our model-building procedure, including hyperparameter tuning. We'll define our outer cross-validation strategy as ordinary 5-fold cross-validation.
+
+```{r, message = FALSE}
+outer <- makeResampleDesc('CV', iters = 5)
+forestWrapper <- makeTuneWrapper('classif.randomForest', resampling = cvForTuning,
+                                 par.set = forestParamSpace, control = randSearch)
+
+parallelStartSocket(cpus = detectCores())
+cvWithTuning <- resample(forestWrapper, zooTask, resampling = outer)
+parallelStop()
+
+cvWithTuning
+```
+
+As you can see, our random forest model performs better compared to our original decision tree. Bagging has greatly improved our classification accuracy.
+
+
+***
+
+
+# Building your First XGBoost Model
+
+We will build an XGBoost model & tune its hyperparameters. There are 8 hyperparameters for us to consider:
+
+* *eta* - Known as *learning rate*. This is a number between 0 & 1, which model weights are multiplied by to give their final weight. Setting this value below 1 slows down the learning process because it 'shrinks' the improvements made by each additional model. Preventing the ensemble from learning too quickly prevents overfitting. A low value is generally better but will make model training take much longer because many model sub-models are needed to achieve good prediction accuracy.
+* *gamma* - The minimum amount of splitting by which a node must improve the predictions. Similar to *cp* value we tuned for rpart.
+* *max_depth* - maximum levels deep that each tree can grow.
+* *min_child_weight* - The minimum degree of impurity needed in a node before attempting to split it (if a node is pure enough, don't try to split it again).
+* *subsample* - The proportion of cases to be randomly sampled (without replacement) for each tree. Setting this to 1 uses all the cases in the training set.
+* *colsample_bytree* - The proportion of predictor variables sampled for each tree. We could also tune *colsample_bylevel* & *colsample_bynode*, which instead sample predictors for each level of depth in a tree & at each node, respectively.
+* *nrounds* - The number of sequentially built trees in the model.
+* *eval_metric* - The type of residual error/loss function we're going to use. For multiclass classification, this will either be the proportion of cases that were incorrectly classified (called *merror* by XGBoost) or the log loss (called *mlogloss* by XGBoost).
+
+The first thing to do is to create a learner with the `makeLearner()` function. This time, our learner is `'classif.xgboost'`.
+
+```{r}
+xgb <- makeLearner('classif.xgboost')
+```
+
+XGBoost only likes to play with numerical predictor variables. Our predictors are currently factors, so we'll need to mutate them into numerics & then define a new task with this mutated tibble. We'll use the `mutate_at()` function to convert all the variables except `type` (by setting `.vars = vars(-type)`) into numerics (by setting `.funs = as.numeric`).
+
+```{r}
+zooXgb <- mutate_at(zooTib, .vars = vars(-type), .funs = as.numeric)
+xgbTask <- makeClassifTask(data = zooXgb, target = 'type')
+```
+
+Now we define our hyperparameter space for tuning.
+
+```{r, message = FALSE}
+xgbParamSpace <- makeParamSet(
+  makeNumericParam('eta', lower = 0, upper = 1),
+  makeNumericParam('gamma', lower = 0, upper = 5),
+  makeIntegerParam('max_depth', lower = 1, upper = 5),
+  makeNumericParam('min_child_weight', lower = 1, upper = 10),
+  makeNumericParam('subsample', lower = 0.5, upper = 1),
+  makeNumericParam('colsample_bytree', lower = 0.5, upper = 1),
+  makeIntegerParam('nrounds', lower = 20, upper = 20),
+  makeDiscreteParam('eval_metric', values = c('merror', 'mlogloss'))
+)
+
+randSearch <- makeTuneControlRandom(maxit = 1000)
+cvForTuning <- makeResampleDesc('CV', iter = 5)
+tunedXgbPars <- tuneParams(xgb, task = xgbTask, resampling = cvForTuning,
+                           par.set = xgbParamSpace, control = randSearch)
+tunedXgbPars
+```
+
+Because more trees are usually better until we stop seeing a benefit, we don't usually tune the *nrounds* hyperparameter, but set it based on our computational budget to start with (here, we set it to 20 by making the `lower` & `upper` arguments the same). Once we've built the model, we can check if the error flattens out after a certain number of trees & decide if we need more or fewer (as we did for the random forest model).
+
+Once we've defined our hyperparameter space, we define our search method as a random search with 1,000 iterations. We should set the number of iterations as high as we like, especially since we're tuning many hyperparameters simultaneously. We define our cross-validation strategy as ordinary 5-fold cross-validation & then run the tuning procedure. Because XGBoost uses all of our cores to parallelise the building of each tree, we won't parallelise the tuning procedure.
+
+Now, we'll train our final XGBoost model using our tuned hyperparameters. We use `setHyperParas()` to make a learner, then pass it to the `train()` function.
+
+```{r}
+tunedXgb <- setHyperPars(xgb, par.vals = tunedXgbPars$x)
+tunedXgbModel <- train(tunedXgb, xgbTask)
+```
+
+Let's plot the loss function against the iteration number to get an idea of whether we included enough trees.
+
+First, we extract the model using `getLearnerModel()`. Next, we can extract a data frame containing the loss function data for each iteration with the `$evaluation_log` component of the model data. This contains the columns `iter` (iteration number) & `train_mlogloss` (the log loss for that iteration). We can plot these against each other to see if the loss has flattened out (indicating that we have trained enough trees).
+
+```{r}
+xgbModelData <- getLearnerModel(tunedXgbModel)
+
+ggplot(xgbModelData$evaluation_log, aes(iter, train_mlogloss)) +
+  geom_line() + geom_point()
+```
+
+The resulting plot is shown above. We can see that the log loss flattens out after about 15 iterations. This means we've trained enough trees & aren't wasting computational resources by training too many.
+
+It's also possible to plot the individual trees in the ensemble, which is a nice way of interpreting the model-building process (unless we have a huge number of trees). For this, we need the DiagrammeR package, then we'll pass the model data object as an argument to the XGBoost package function `xgb.plot.tree()`. We'll also specify which trees to plot with the `trees` argument.
+
+```{r}
+xgboost::xgb.plot.tree(model = xgbModelData, trees = 1:5)
+```
+
+Notice that the trees we're using are shallow, & some may be decision stumps (do not have a split).
+
+Finally, let's cross-validate our model-building process exactly as we did for our random forest & rpart models.
+
+```{r, message = FALSE}
+outer <- makeResampleDesc('CV', iters = 3)
+
+xgbWrapper <- makeTuneWrapper('classif.xgboost', resampling = cvForTuning,
+                              par.set = xgbParamSpace, control = randSearch)
+cvWithTuning <- resample(xgbWrapper, xgbTask, resampling = outer)
+cvWithTuning
+```
+
+Phenomenal. The cross-validation estimates that our model has high accuracy, over 95%!
+
+
+***
+
+
+# Strengths & Weaknesses of Tree-Based Algorithms
+
+The strengths of the random forest & XGBoost algorithms are as follows:
+
+* They can handle categorical & continuous predictor variables (thought XGBoost requires some numerical encoding).
+* They make no assumptions about the distribution of the predictor variables.
+* They can handle missing values in sensible ways.
+* They can handle continuous variables on different scales.
+* Ensemble techniques can drastically improve model performance over individual trees. XGBoost in particular is excellent at reducing both bias & variance.
+
+The weaknesses of tree-based algorithms are these:
+
+* Random forest reduces variance compared to rpart, but does not reduce bias (XGBoost reduces both).
+* XGBoost can be computationally expensive to tune because it has many hyperparameters & grows trees sequentially.
+
+
+***
+
+
+# Benchmarking Algorithms Against Each Other
+
+*Benchmarking* is used to compare the performance of several algorithms on a particular task. It is simple. We create a list of learners we're interested in trying, & let them fight it out to find the one that learns the best-performing model. We'll do this with `xgbTask`.
+
+First, we create a list of learner algorithms include k-nearest negihbours (`'classif.knn'`), multinomial logistic regression (`'classif.LiblineRL1LogReg'`), support vector machine (`'classif.svm'`), our `tunedTree` model that we trained in our previous lessons, & the `tunedForest` & `tunedXgb` models that we trained in this lesson. 
+
+We define our cross-validation method using `makeResampleDesc()`. This time, we opt for 10-fold cross-validation repeated 5 times. It's important to note that mlr performs in such a way here: while the data is partitioned randomly into folds for each repeat, *the same partitioning* is used for every learner. Put more plainly, for each cross-validation repeat, each learner in the benchmark gets exactly the same training set & test set.
+
+Finally, we use the `benchmark()` function to run the benchmark experiment. The first argument is the list of learners, the second argumnet is the name of the task, & the third argument is the cross-validation method.
+
+```{r, message = FALSE}
+learners = list(makeLearner('classif.knn'),
+                makeLearner('classif.LiblineaRL1LogReg'),
+                makeLearner('classif.svm'),
+                tunedTree,
+                tunedForest,
+                tunedXgb)
+benchCV <- makeResampleDesc('RepCV', folds = 10, reps = 5)
+bench <- benchmark(learners, xgbTask, benchCV)
+bench
+```
+
+What a surprise! The humble k-nearest neighbours is performing better on this task than the mighty XGBoost algorithm, -- even though we didn't tune it.
+
+
+***
+
+
+# Summary
+
+* The random forest & XGBoost algorithms are supervised learners for both classification & regression problems.
+* Ensemble techniques construct multiple sub-models to result in a model that performs better than any one of its components alone.
+* Bagging is an ensemble technique that trains multiple sub-models in parallel on bootstrap samples of the training set. Each sub-model then votes on the prediction for new cases. Random forest is an example of a bagging algorithm.
+* Boosting is an ensemble technique that trains multiple sub-models sequentially, where each subsequent sub-model focuses on the mistakes of the previous set of sub-models. AdaBoost & XGBoost are examples of boosting algorithms.
+* Benchmarking allows us to compare the performance of multiple algorithms/models on a single task.

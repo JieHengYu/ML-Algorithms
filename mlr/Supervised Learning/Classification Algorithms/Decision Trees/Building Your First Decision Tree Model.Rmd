@@ -1,0 +1,207 @@
+---
+title: "Building Your First Decision Tree Model"
+author: "Jie Heng Yu"
+date: "2/6/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(plotly)
+library(parallel) # multithreading
+library(parallelMap) # multithreading
+library(rpart.plot) # getLearnerModel()
+```
+
+
+# Building Your First Decision Tree Model
+
+Imagine that we work in public engagement at a wildlife sanctuary. We're task with creating an interactive game for children, to teach them about different animal classes. The game asks the children to think of any animal in the sanctuary & then asks them questions about the physical characteristics of that animal. Based on the responses the child gives, the model should tell the child what class their animal belongs to (mammal, bird, reptile, & so on). It's important for your model to be general enough that it can be used at other wildlife sanctuaries.
+
+We'll start by loading & exploring the data set.
+
+```{r}
+data(Zoo, package = 'mlbench')
+zooTib <- as_tibble(Zoo)
+zooTib
+```
+
+We have a tibble containing 101 cases & 17 variables of observations made on various animals; 16 of these variables are logical, indicating the presence or absence of some characteristic, & the `type` variable is a factor containing the animal classes we wish to predict.
+
+Unfortunately, mlr won't let us create a task with logical predictors, so let's convert them into factors. Dplyr's`mutate_if()` function takes the data as the first argument & the second argument is our criterion for selecting columns, so we'll use `is.logical()` to consider only our logical columns. The final argument is what we do to those columns, so I've used `as.factor()` to convert the logical columns into factors.
+
+```{r}
+zooTib <- mutate_if(zooTib, is.logical, as.factor)
+zooTib
+```
+
+
+***
+
+
+# Training the Decision Tree Model
+
+Let's define our task & learner, & build a model as usual. This time, we supply 'classif.rpart' as the argument to the `makeLearner()` function to specify that we're going to use rpart.
+
+```{r, warning = FALSE}
+zooTask <- makeClassifTask(data = zooTib, target = 'type')
+tree <- makeLearner('classif.rpart')
+```
+
+Next, we perform hyperparameter tuning. Recall that the first step is to define a hyperparameter space over which we want to search. The most important hyperparameters for tuning are *minsplit*, *minbucket*, *cp*, & *maxdepth*, but there are a few others that are useful to know.
+
+The *maxcomplete* hyperparameter controls how many candidate splits can be displayed for each node in the model summary. The model summary shows the candidate splits in order of how much they improved the model (Gini gain). It may be useful to understand what the next-best split was after the one that was actually used, but tuning *maxcomplete* doesn't affect model performance, only its summary.
+
+The *maxsurrogate* hyperparameter is similar to *maxcomplete* but controls how many *surrogate splits* are shown. A surrogate split is a split used if a particular case is missing data for the actual split. In this way, rpart can handle missing data as it learns which splits can be used in place of missing variables. The *maxsurrogate* hyperparameter controls how many of these surrogates to retain in the mode (if a case is missing a value for the main split, it is passed to the first surrogate, & so on). Although we don't have any missing data in our data set, future cases we wish to predict might. We could se this to zero to save som computation time, which is equivalent to not using surrogate variables, but doing so may reduce the accuracy of predictions made on future cases with missing data. The default value of 5, however, is usually fine.
+
+The *usesurrogate* hyperparameter controls how the algorithm uses surrogate splits. A value of zero means surrogates will not be used, & cases with missing data will not be classified. A value of 1 means surrogates will be used, but if a case is missing data for the actual split & for all the surrogate splits, that case will not be classified. The default value of 2 means surrogates will be used, but a case with missing data for the actual split & for all the surrogate splits will be sent down the branch that contained the most cases. The default value of 2 is usually appropriate.
+
+```{r}
+getParamSet(tree)
+```
+
+Now, let's define the hyperparameter space we want to search over. We're going to tune the values of *minsplit* (an integer), *minbucket* (an integer), *cp* (a numeric), & *maxdepth* (an integer).
+
+```{r}
+treeParamSpace <- makeParamSet(
+  makeIntegerParam('minsplit', lower = 5, upper = 20),
+  makeIntegerParam('minbucket', lower = 3, upper = 10),
+  makeNumericParam('cp', lower = 0.01, upper = 0.1),
+  makeIntegerParam('maxdepth', lower = 3, upper = 10)
+)
+treeParamSpace
+```
+
+Next, we can define how we're going to search the hyperparameter space. Because our hyperparameter space is quite large, we're going to use random search rather than grid search. Recall that a random search is not exhaustive (will not try every hyperparameter combination) but will randomly select combinations as many times (iterations) as we tell it to. We'll use 200 iterations.
+
+We'll also define our cross-validations strategy for tuning. Here, we'll use ordinary 5-fold cross-validation. This will split the data into five folds & use each fold as the test set once. For each test set, a model will be trained on the rest of the data (the training set). This will be performed for each combination of hyperparameter values tried by the random search.
+
+**Note**: Ordinarily, if classes are imbalanced, we'd use stratified sampling. However, because we have very few cases in some of the classes, there are not enough cases to stratify. For this example we won't stratify; but in situations where you have very few cases in a class, we should consider whether there is enough data to justify keeping that class in the model.
+
+```{r}
+randSearch <- makeTuneControlRandom(maxit = 200)
+cvForTuning <- makeResampleDesc('CV', iters = 5)
+```
+
+Let's perform our hyperparameter tuning.
+
+```{r, message = FALSE}
+parallelStartSocket(cpus = detectCores())
+tunedTreePars <- tuneParams(tree, task = zooTask, resampling = cvForTuning,
+                            par.set = treeParamSpace, control = randSearch)
+parallelStop()
+tunedTreePars
+```
+
+To speed things up, we employed parallelisation by running `parallelStartSocket()`, setting the number of CPUs equal to the number of cores our machine has. Then we use the `tuneParams()` function to start the tuning process. The arguments are the same as we've used previously: the first is the learner, the second is the task, `resampling` is the cross-validation method, `par.set` is the hyperparameter space, & `control` is the search method. Once it's completed, we stop parallelisation & print our tuning results.
+
+Our model has above 90% accuracy in predicting new cases. Pretty good.
+
+
+### Training the Model with the Tuned Hyperparameters
+
+Now that we have tuned hyperparameters, we can train our final model using them. We use the `setHyperPars()` function to create a learner using the tuned hyperparameters, which we access using `tunedTreePars$x`. We can then train the final model using the `train()` function, as usual.
+
+```{r}
+tunedTree <- setHyperPars(tree, par.vals = tunedTreePars$x)
+tunedTree
+tunedTreeModel <- train(tunedTree, zooTask)
+tunedTreeModel
+```
+
+One of the wonderful things about decision trees is how interpretable they are. The easiest way to interpret the model is to draw a graphical representation of the tree. There are a few ways of plotting decision tree models in R, but my favourite is the `rpart.plot()` function from the package of the same name. Let's install the rpart.plot package first & then extract the model using the `getLearnerModel()` function.
+
+```{r}
+treeModelData <- getLearnerModel(tunedTreeModel)
+treeModelData
+rpart.plot(treeModelData, roundint = FALSE,
+           box.palette = 'BuBn', type = 5)
+```
+
+The first argument of the `rpart.plot()` function is the model data. Because we trained this model using mlr, the function will give us a warning that it cannot find the data used to train the mode. We can safely ignore this warning, but if it irritates you, we can prevent it by supplying the argument `roundint = FALSE`. The function will also complain complain if we have more classes that its default colour palette (neediest function ever!). Either ignore this, or ask for a different palette by setting the `box.palette` argument equal to one of the predefined palettes. The `type` argument changes how the tree is displayed.
+
+The first node asks whether the animal produces milk or not. The split was chosen because it has the highest Gini gain of all candidate splits (it immediately discriminates mammals, which make up 41% of the training set from the other classes). The leaf nodes tell us which class is classified by that node & the proportions of each class in that node.
+
+To inspect the *cp* values for each split, we can use the `printcp()` function. This function takes the model data as the first argument & an optional `digits` argument specifying how many decimal places to print in the output. There is some useful information in the output, such as the variables actually used for splitting the data & the root node error (the error before any splits). Finally, the output includes a table of the *cp* values for each split.
+
+```{r}
+printcp(treeModelData, digits = 3)
+```
+
+Recall that the *cp* values are calculated as:
+
+$$cp = \frac{p(incorrect_{l + 1} - p(incorrect_l))}{n(splits_l) - n(splits_{l + 1})}$$
+
+In the above example, the *cp* value for the first split is: 
+
+$$cp = \frac{1.00 - 0.667}{1 - 0}$$
+
+The *cp* value for the second split is:
+
+$$cp = \frac{0.667 - 0.450}{2 - 1}$$
+
+& so on. If any candidate split would yield a *cp* value lower than the threshold set by tuning, the node is not split further.
+
+
+***
+
+
+# Cross-Validating our Decision Tree Model
+
+Now let's cross-validate our model-building process, including hyperparameter tuning. To reiterate, we *must* include data-dependent preprocessing in our cross-validation.
+
+First, we define our outer cross-validation loop. We'll use 5-fold cross-validation as my outer cross-validation loop. We will use the `cvForTuning` resampling description from before.
+
+Next, we create our wrapper, by "wrapping together" our learner & hyperparameter tuning process. We supply our inner cross-validation strategy, hyperparameter space, & search method to the `makeTuneWrapper()` function.
+
+Finally, we can perform parallelisation with the `parallelStartSocket()` function, & start the cross-validation process with the `resmaple()` function. The `resample()` function takes our wrapped learner, task, & outer cross-validation strategy as arguments.
+
+```{r, message = FALSE}
+outer <- makeResampleDesc('CV', iters = 5)
+treeWrapper <- makeTuneWrapper('classif.rpart', resampling = cvForTuning, 
+                               par.set = treeParamSpace, control = randSearch)
+parallelStartSocket(cpus = detectCores())
+cvWithTuning <- resample(treeWrapper, zooTask, resampling = outer)
+parallelStop()
+```
+
+Now lets look at the cross-validation result & see how our model-building process performed.
+
+```{r}
+cvWithTuning
+```
+
+Well, this is a little disappointing. During hyperparameter tuning, the best hyperparameter combination gave us a lower mean misclassification error (MMCE). But our cross-validated estimate of model performance gave us a higher MMCE. What's going on? Well, this is an example of overfitting. Our model is performing better during hyperparameter tuning than during cross-validation. This is also a good example of why it's important to include hyperparameter tuning inside our cross-validation procedure.
+
+We've just discovered the main problem with the rpart algorithm (and decision trees in general); they tend to produce models that are overfit. How do we overcome this problem? The answer is to use the *ensemble method*, an approach where we use multiple models to make predictions for a single task, which we'll demonstrate in the next lesson.
+
+
+***
+
+
+# Strengths & Weaknesses of Tree-Based Algorithms
+
+The strengths of tree-based algorithms are as follows:
+
+* The intuition behind tree-building is simple, & each individual tree is interpretable.
+* It can handle categorical & continuous predictor variables.
+* It makes no assumptions about the distribution of the predictor variables.
+* It can handle missing values in sensible ways.
+
+The weaknesses of tree-based algorithms are as follows:
+
+* Individual trees are very susceptible to overfitting -- so much so that they are rarely used.
+
+
+***
+
+
+# Summary
+
+* The rpart algorithm is a supervised learner for both classification & regression problems.
+* Tree-based learners start with all the cases in the root node & find sequential binary splits until cases find themselves in leaf nodes.
+* Tree construction is a greedy process & can be limited by setting stopping criteria (such as the minimum number of cases required in a node before it can be split).
+* The Gini gain is a criterion used to decide which predictor variable will result in the best split at a particular node.
+* Decision trees have a tendency to overfit the training set.
