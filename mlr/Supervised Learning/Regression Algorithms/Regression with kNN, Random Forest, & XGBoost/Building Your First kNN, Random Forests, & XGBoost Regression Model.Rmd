@@ -1,0 +1,274 @@
+---
+title: "Building Your First kNN, Random Forests, & XGBoost Regression Model"
+author: "Jie Heng Yu"
+date: "4/1/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(plotly)
+library(parallel)
+library(parallelMap)
+```
+
+
+# Building Your First kNN Regression Model
+
+Imagine we're a group of chemical engineers trying to predict the amount of heat released by various batches of fuel, based on measurements you made on each batch. We're going to train a kNN model on this task & compare how it performs to a random forest & an XGBoost model.
+
+We'll start by loading & exploring our data set. The data set we're going to work with is contained inside mlr's `fulesubset.task`. We load this into our R session the same way we would any built-in data set: using the `data()` function. We can then use mlr's `getTaskData()` function to extract the data from the task, so we can explore it. As always, we use the `as_tibble()` function to convert the data frame into a tibble.
+
+```{r}
+data('fuelsubset.task')
+fuel <- getTaskData(fuelsubset.task)
+fuelTib <- as_tibble(fuel)
+fuelTib
+```
+
+We have a tibble containing 129 different batches of fuel & 367 variables/features. The `heatan` variable is the amount of energy released by a certain quantity of fuel when it is combusted (measured in megajoules). The `h20` variable is the percentage of humidity in the fuel's container. The remaining variables show how much ultraviolet or near-infrared light of a particular wavelength each batch of fuel absorbs (each variable represents a different wavelength).
+
+Let's plot the data to get an idea of how the `heatan` variable correlates with the `absorbance` variable at various wavelengths of ultraviolet & near-infrared light.
+
+Because we want to plot a separate `geom_smooth()` line for every case in the data, we first pipe the data into a `mutate()` function call, where we create an `if` variable that just acts as a row index. We use `nrow(.)` to specify the number of rows in the data object piped into `mutate()`. We then pipe this result into a `gather()` function to create a key-value pair of variables containing the spectral information (`wavelength` as the key, `absorbance` at that wavelength as the value). 
+
+```{r}
+fuelUntidy <- fuelTib %>%
+  mutate(id = 1:nrow(.)) %>%
+  gather(key = 'variable', value = 'absorbance', c(-heatan, -h20, -id)) %>%
+  mutate(spectrum = str_sub(variable, 1, 3),
+         wavelength = as.numeric(str_extract(variable, '(\\d)+')))
+fuelUntidy
+```
+
+Now that we've formatted our data for plotting, we're going to draw three plots:
+
+* `absorbance` versus `heatan`, with a separate curve for each wavelength
+* `wavelength` versus `absorbance`, with a separate curve for every case
+* Humidity (`h20`) versus `heatan`
+
+In the plot for `absorbance` versus `heatan`, we wrap `wavelength` inside the `as.factor()` function, so that each wavelength will be drawn with a discrete colour, rather than a gradient of colours from low to high wavelengths). To prevent `ggplot()` from drawing a huge legend showing the colour of each of the lines, we suppress the legend by adding `theme(legend.position = 'none')`. We facet by spectrum to create subplots using the `scales = 'free_x'` argument. In the plot for `wavelength` versus absorbance`, we set the `group` aesthetic equal to the `id` variable we created, so that the `geom_smooth()` layer will draw a separate curve for each batch of fuel.
+
+```{r}
+ggplotly(
+  fuelUntidy %>%
+    ggplot(aes(absorbance, heatan, col = as.factor(wavelength))) +
+      facet_wrap(~ spectrum, scales = 'free_x') +
+      geom_smooth(se = FALSE, size = 0.2) +
+      labs(title = 'Absorbance vs Heatan for each Wavelength') +
+      theme_bw() +
+      theme(legend.position = 'none')
+)
+
+ggplotly(
+  fuelUntidy %>%
+    ggplot(aes(wavelength, absorbance, group = id, col = heatan)) +
+      facet_wrap(~ spectrum, scales = 'free_x') +
+      geom_smooth(se = FALSE, size = 0.2) +
+      labs(title = 'Wavelength vs Absorbance for each Batch') +
+      theme_bw()
+)
+
+ggplotly(
+  fuelUntidy %>%
+    ggplot(aes(h20, heatan)) +
+    geom_smooth(se = FALSE) +
+    labs(title = 'Humidity vs Heatan') +
+    theme_bw()
+)
+```
+
+In the plots of `absorbance` against `heatan`, each line corresponds to a particular wavelength. The relationship between each predictor variable & the outcome variable is complex & nonlinear. There is also a nonlinear relationship between `h20` & `heatan`. 
+
+In the plots of `wavelength` against `absorbance`, each line corresponds to a particular batch of fuel, & the lines show its absorbance of ultraviolet & near-infrared light. The shading of the line corresponds to the `heatan` value of that batch. It's difficult to identify patterns in these plots, but certain `absorbance` profiles seem to correlate with higher & lower `heatan` values.
+
+Because the predefined `fuelsubset.task` defines the ultraviolet & near-infrared spectra as functional variables, we're going to define our own task, treating each wavelength as a separate predictor. We do this, as usual, with the `makeRegrTask()` function, setting the `heatan` variable as our target. We then define our kNN learner using the `makeLearner()` function.
+
+```{r, warning = FALSE}
+fuelTask <- makeRegrTask(data = fuelTib, target = 'heatan')
+kknn <- makeLearner('regr.kknn')
+```
+
+**Note: Notice that for regression, the name fo the learner is `'regr.kknn'` with two k's, rather than the `'classif.knn'` for classification. This is because this function is taken from the kknn package, which allows us to perform *kernel k-nearest neighbours*, where we use a kernel function (like with SVMs) to find a linear decision boundary between classes.**
+
+
+### Tuning the k Hyperparameter
+
+Remember that for regression, the value of *k* determines how many of the nearest neighbours' outcome values to average when making predictions on new cases. We first define the hyperparameter search space using the `makeParamSet()` function, & define `k` as a discrete hyperparameter with possible values 1 through 12. Then we define our search procedure as a grid search (so that we will try every value in the search space), & define a 10-fold cross-validation strategy.
+
+As we've done before, we run the tuning process using the `tuneParams()` function, supplying the learner, task, cross-validation method, hyperparameter space, & search procedure as arguments.
+
+```{r, message = FALSE, warning = FALSE}
+kknnParamSpace <- makeParamSet(makeDiscreteParam('k', values = 1:12))
+gridSearch <- makeTuneControlGrid()
+kFold <- makeResampleDesc('CV', iters = 10)
+tunedK <- tuneParams(kknn, task = fuelTask, resampling = kFold,
+                     par.set = kknnParamSpace, control = gridSearch)
+
+tunedK
+```
+
+We can plot the hyperparameter tuning process by extracting the tuning data with the `generateHyperParsEffectData()` function & passing this to the `plotHyperParsEffect()` function, supplying our hyperparameter (`'k'`) as the x-axis & MES (`'mse.test.mean'`) as the y-axis. Setting the `plot.type` argument equal to `'line'` connects the samples with a line.
+
+```{r}
+knnTuningData <- generateHyperParsEffectData(tunedK)
+plotHyperParsEffect(knnTuningData, x = 'k', y = 'mse.test.mean', 
+                    plot.type = 'line') +
+  theme_bw()
+```
+
+We can see that the mean MSE is the least somewhere between k = 5 & k = 7, inclusively. Now that we have our tuned value of *k*, we can define a learner using that value, with the `setHyperPars()` function & train a model using it.
+
+
+***
+
+
+# Building Your First Random Forest Regression Model
+
+**Note: We can start with the rpart algorithm to build a regression tree, but it is almost always outperformed by bagged & boosted learners. As such, we will dive straight into random forest & XGBoost.**
+
+We'll start by defining our random forest learner. Notice that rather than `'classif.randomForest'` in classification, the regression equivalent is `'regr.randomForest'`.
+
+```{r}
+forest <- makeLearner('regr.randomForest')
+```
+
+Next, we tune the hyperparameters of our random forest learner: `ntree`, `mtry`, `nodesize`, & `maxnodes`. Recall that this is what each of the hyperparameters mean:
+
+* `ntree` controls the number of individual trees to train. More trees is usually better until adding more doesn't improve performance further.
+* `mtry` controls the number of predictor variables that are randomly sampled for each individual tree. Training each individual tree on a random selection of predictor variables helps keep the trees uncorrelated & thereform helps prevent the ensemble method form overfitting the training set.
+* `nodesize` defines the minimum number of cases allowed in a leaf node. For example, setting `nodesize` equal to 1 would allow each case in the training set to have its own leaf.
+* `maxnodes` defines the maximum number of nodes in each individual tree.
+
+As usual, we create our hyperparameter search space using the `makeParamSet()` function , defining each hyperparameter as an integer with sensible lower & upper bounds. We define a random search with 100 iterations & start the tuning procedure with our forest learner, fuel task, & `holdout` cross-validation strategy.
+
+```{r, message = FALSE}
+forestParamSpace <- makeParamSet(
+  makeIntegerParam('ntree', lower = 50, upper = 50),
+  makeIntegerParam('mtry', lower = 100, upper = 367),
+  makeIntegerParam('nodesize', lower = 1, upper = 10),
+  makeIntegerParam('maxnodes', lower = 5, upper = 30)
+)
+
+randSearch <- makeTuneControlRandom(maxit = 100)
+
+parallelStartSocket(cpus = detectCores())
+
+tunedForestPars <- tuneParams(forest, task = fuelTask, resampling = kFold,
+                              par.set = forestParamSpace, control = randSearch)
+
+parallelStop()
+
+tunedForestPars
+```
+
+Next, let's train the random forest model using our tuned hyperparameters. Once we've trained the model, it's a good idea to extract the model information & pass this to the `plot()` function to plot the out-of-bag error. Recall that the out-of-bag error is the mean prediction error for each case by trees that *did not* include that case in their bootstrap sample. The only difference between the out-of-bag error for classification & regression random forests is that in classification, the error was the proportion of cases that were misclassified; but in regression, the error is the mean square error.
+
+```{r}
+tunedForest <- setHyperPars(forest, par.vals = tunedForestPars$x)
+tunedForestModel <- train(tunedForest, fuelTask)
+forestModelData <- getLearnerModel(tunedForestModel)
+plot(forestModelData)
+```
+
+It looks like the out-of-bag error stabilises after about 30-40 bagged trees, so we can be satisfied that we included enough trees in our forest.
+
+
+***
+
+
+# Building Your First XGBoost Regression Model
+
+We'll start by defining our XGBoost learner. Just like for the kNN & random forest learners, instead of using `'classif.xgboost'`, the regression equivalent is `'regr.xgboost'`.
+
+```{r}
+xgb <- makeLearner('regr.xgboost')
+```
+
+Next, we're going to tune the hyperparameters of our XGBoost learner: `eta`, `gamma`, `max_depth`, `min_child_weight`, `subsample`, `colsample_bytree`, & `nrounds`. Recall that these hyperparameters mean the following:
+
+* `eta` is known as the *learning rate*. It takes a value between 0 & 1, which is multiplied by the model weight of each tree to slow down the learning process to prevent overfitting.
+* `gamma` is the minimum amount of splitting by which a node must improve the loss function (MSE is the case of regression).
+* `max_depth` is the maximum number of levels deep that each tree can grow.
+* `min_child_weight` is the minimum degree of impurity needed in a node before attempting to split it (if a node is pure enough, don't try to split it again).
+* `subsample` is the proportion of cases to be randomly sampled (without replacement) for each tree. Setting this to 1 uses all the cases in the training set.
+* `colsample_bytree` is the proportion of predictor variables sampled for each tree. We could also tune `colsample_bylevel` & `colsample_bynode`, which instead sample predictors for each level of depth in a tree & at each node, respectively.
+* `nrounds` is the number of sequentially built trees in the model.
+
+We define the type & upper & lower bounds of each of these hyperparameters that we'll search over. We define `max_depth` & `nrounds` as integer hyperparameters, & all the others as numerics. Once the search space is defined, we start the tuning process just like we have before.
+
+```{r, message = FALSE}
+xgbParamSpace <- makeParamSet(
+  makeNumericParam('eta', lower = 0, upper = 1),
+  makeNumericParam('gamma', lower = 0, upper = 10),
+  makeIntegerParam('max_depth', lower = 1, upper = 20),
+  makeNumericParam('min_child_weight', lower = 1, upper = 10),
+  makeNumericParam('subsample', lower = 0.5, upper = 1),
+  makeNumericParam('colsample_bytree', lower = 0.5, upper = 1),
+  makeIntegerParam('nrounds', lower = 30, upper = 30)
+)
+tunedXgbPars <- tuneParams(xgb, task = fuelTask, resampling = kFold,
+                            par.set = xgbParamSpace, control = randSearch)
+tunedXgbPars
+```
+
+Now that we have our tuned combination of hyperparameters, we can train the final model. We'll then extract the model information & use it to plot the iteration number (tree number) against the RMSE to see if we included enough trees in our ensemble. The RMSE information for each tree number is contained in the `$evaluation_log` component of the model information, so we use this as the data argument for the `ggplot()` function, specify `iter` & `train_rmse` to plot the tree number & its RMSE as the x & y aesthetics, respectively.
+
+```{r}
+tunedXgb <- setHyperPars(xgb, par.vals = tunedXgbPars$x)
+tunedXgbModel <- train(tunedXgb, fuelTask)
+xgbModelData <- getLearnerModel(tunedXgbModel)
+
+ggplotly(
+  ggplot(xgbModelData$evaluation_log, aes(iter, train_rmse)) +
+    geom_line() + geom_point() + theme_bw()
+)
+```
+
+We can see that 30 iterations/trees is just about enough for the RMSE to have flattened out (including more iterations won't result in a better model).
+
+
+***
+
+
+# Benchmarking the kNN, Random Forest, & XGBoost Model-Building Processes
+
+Here, we're going to benchmark the kNN, random forest, & XGBoost model-building processes against each other. We start by creating tuning wrappers that wrap together each learner with its hyperparameter tuning process. Then we create a list of these wrapper learners to pass into `benchmark()`. As this process will take some time, we're going to define & use a `holdout` cross-validation procedure to evaluate the performance of each wrapper (ideally we use k-fold, or repeated k-fold).
+
+```{r, message = FALSE}
+kknnWrapper <- makeTuneWrapper(kknn, resampling = kFold, 
+                               par.set = kknnParamSpace, control = gridSearch)
+forestWrapper <- makeTuneWrapper(forest, resampling = kFold,
+                                 par.set = forestParamSpace, control = randSearch)
+xgbWrapper <- makeTuneWrapper(xgb, resampling = kFold, 
+                              par.set = xgbParamSpace, control = randSearch)
+
+learners = list(kknnWrapper, forestWrapper, xgbWrapper)
+holdout <- makeResampleDesc('Holdout')
+bench <- benchmark(learners, fuelTask, holdout)
+
+bench
+```
+
+According to this benchmark result, the random forest algorithm is likely to give us the best performing model, with the lower mean prediction error (square root of mse).
+
+
+***
+
+
+# Strengths & Weaknesses of kNN, Random Forest, & XGBoost
+
+The strengths & weaknesses of kNN, random forest, & XGBoost algorithms are the same for regression as they were for classification.
+
+
+***
+
+
+# Summary
+
+* The k-nearest neighbours (kNN) & tree-based algorithms can be used for regression as well as classification.
+* When predicting a continuous outcome variable, the predictions made by kNN are the mean outcome values of the k-nearest neighbours.
+* When predicting a continuous outcome variable, the leaves of tree-based algorithms are the mean of the cases within than leaf.
+* Out-of-bag error & RMSE can still be used to identify whether random forest & XGBoost ensembles have enough trees, respectively, in regression problems.

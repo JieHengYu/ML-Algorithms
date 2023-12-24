@@ -1,0 +1,180 @@
+---
+title: "Building Your First GAM"
+author: "Jie Heng Yu"
+date: "3/12/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(plotly)
+library(parallel)
+library(parallelMap)
+```
+
+```{r, include = FALSE, warning = FALSE, message = FALSE}
+data(Ozone, package = 'mlbench')
+ozoneTib <- as_tibble(Ozone)
+names(ozoneTib) <- c('Month', 'Date', 'Day', 'Ozone', 'Press_height', 'Wind', 'Humid', 'Temp_Sand', 'Temp_Monte', 'Inv_height', 'Press_grad', 'Inv_temp', 'Visib')
+ozoneClean <- mutate_all(ozoneTib, as.numeric) %>%
+  filter(is.na(Ozone) == FALSE)
+imputeMethod <- imputeLearner('regr.rpart')
+ozoneImp <- impute(as.data.frame(ozoneClean), classes = list(numeric = imputeMethod))
+ozoneTask <- makeRegrTask(data = ozoneImp$data, target = 'Ozone')
+lin <- makeLearner('regr.lm')
+filterVals <- generateFilterValuesData(ozoneTask, 
+                                       method = 'linear.correlation')
+filterWrapper <- makeFilterWrapper(learner = lin, 
+                                   fw.method = 'linear.correlation')
+lmParamSpace <- makeParamSet(
+  makeIntegerParam('fw.abs', lower = 1, upper = 12)
+)
+gridSearch <- makeTuneControlGrid()
+kFold <- makeResampleDesc('CV', iters = 10)
+tunedFeats <- tuneParams(filterWrapper, task = ozoneTask, resampling = kFold, 
+                          par.set = lmParamSpace, control = gridSearch)
+filteredTask <- filterFeatures(ozoneTask, fval = filterVals, 
+                               abs = unlist(tunedFeats$x))
+filteredModel <- train(lin, filteredTask)
+featSelControl <- makeFeatSelControlSequential(method = 'sfbs')
+selFeats <- selectFeatures(learner = lin, task = ozoneTask, resampling = kFold, control = featSelControl)
+ozoneSelFeat <- ozoneImp$data[, c('Ozone', selFeats$x)]
+ozoneSelFeatTask <- makeRegrTask(data = ozoneSelFeat, target = 'Ozone')
+wrapperModel <- train(lin, ozoneSelFeatTask)
+imputeMethod <- imputeLearner('regr.rpart')
+imputeWrapper <- makeImputeWrapper(lin, 
+                                   classes = list(numeric = imputeMethod))
+featSelWrapper <- makeFeatSelWrapper(learner = imputeWrapper,
+                                     resampling = kFold, 
+                                     control = featSelControl)
+ozoneTaskWithNAs <- makeRegrTask(data = ozoneClean, target = 'Ozone')
+kFold3 <- makeResampleDesc('CV', iters = 3)
+parallelStartSocket(cpus = detectCores() - 1)
+lmCV <- resample(featSelWrapper, ozoneTaskWithNAs, resampling = kFold3)
+parallelStop()
+wrapperModelData <- getLearnerModel(wrapperModel)
+```
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+ozoneUntidy <- gather(ozoneClean, key = 'Variable', value = 'Value', -Ozone)
+ggplotly(
+  ggplot(ozoneUntidy, aes(Value, Ozone)) +
+    facet_wrap(~Variable, scale = 'free_x') +
+    geom_point(size = 0.5) + geom_smooth() + 
+    geom_smooth(method = 'lm', col = 'red') +
+    theme_bw()
+)
+
+par(mfrow = c(2, 2))
+plot(wrapperModelData)
+par(mfrow = c(1, 1))
+```
+
+
+# Building Your First GAM
+
+We finished the previous lesson by interrogating the diagnostic plots of our linear regression model & deciding it looked as though we have nonlinear relationships in the data. Therefore, in this lesson, we'll learn how to model the data using a GAM to account for the nonlinear relationships between the predictors & outcome.
+
+Based on the diagrams from the previous lesson, shown above, there is a curved relationship between `Month` & `Ozone`, peaking in summer & declining in winter. Because we also have access to the day of the month, we can get more predictive value by combining the two. Put it another way, instead of getting the month-of-the-year resolution, we can get the day-of-the-year resolution from our data. 
+
+To achieve this, we mutate a new column called `DayOfYear`. We use the `interaction()` function to generate a variable that contains the information from both the `Date` & `Month` variables. Because the `interaction()` function returns a factor, we wrap it inside the `as.numeric()` function to convert it into a numeric vector that represents the days of the year.
+
+Because the new variable contains the information from the `Date` & `Month` variables, we remove them from the data using the `select()` function. We then plot our new variable to see how it relates to `Ozone`.
+
+```{r, message = FALSE}
+ozoneForGam <- mutate(ozoneClean,
+                      DayOfYear = as.numeric(interaction(Date, Month))) %>%
+  select(c(-'Date', -'Month'))
+
+ggplotly(
+  ggplot(ozoneForGam, aes(DayOfYear, Ozone)) +
+    geom_point() + geom_smooth() + theme_bw()
+)
+```
+
+The resulting plot is shown above. The relationship between ozone levels & the time of year is even clearer if we use day, instead of month, resolution.
+
+Now let's define our task, imputation wrapper, & feature-selection wrapper, just as we did for our linear regression model. Sadly, there isn't an implementation of ordinary GAMs wrapped by mlr. Instead, however, we have access to the gamboost algorithm, which uses boosting to learn an ensemble of GAM models. Therefore, we'll use the `regr.gamboost` learner. Aside from the different learner (`regr.gamboost` instead of `regr.lm`), we create our imputation & feature selection wrappers exactly the same way. 
+
+```{r}
+gamTask <- makeRegrTask(data = ozoneForGam, target = 'Ozone')
+imputeMethod <- imputeLearner('regr.rpart')
+gamImputeWrapper <- makeImputeWrapper('regr.gamboost',
+                                      classes = list(numeric = imputeMethod))
+gamFeatSelControl <- makeFeatSelControlSequential(method = 'sfbs')
+kFold <- makeResampleDesc('CV', iters = 10)
+gamFeatSelWrapper <- makeFeatSelWrapper(learner = gamImputeWrapper,
+                                        resampling = kFold,
+                                        control = gamFeatSelControl)
+```
+
+All that's left to do is to cross-validate the model-building process. Because the gamboost algorithm is much more computationally intense than linear regression, we're going to use `holdout` as the method for outer cross-validation.
+
+```{r, message = FALSE, warning = FALSE}
+holdout <- makeResampleDesc('Holdout')
+gamCV <- resample(gamFeatSelWrapper, gamTask, resampling = holdout)
+gamCV
+```
+
+Our cross-validation suggests that modeling the data using the gamboost algorithm will outperform a model learned by linear regression (the latter gave us a mean MSE of approximately 21 in the previous lesson).
+
+Now let's actually build a model so we can interrogate our GAM model to understand the nonlinear functions its learned for our predictor variables.
+
+First, we train a boosted GAM using our `gamTask`. We use `gamFeatSelWrapper` as our learner, because this performs imputation & feature selection. To speed things along, we can parallelise the feature selection by running the `parallelStartSocket()` function before running the `train()` function to actually train the model.
+
+We then extract the model information using the `getLearnerModel()` function. This time, because our learner is a wrapper function, we need to supply an additional argument `more.unwrap = TRUE`, to tell mlr that it needs to go all the way down through the wrappers to extract the base model information.
+
+```{r, message = FALSE}
+parallelStartSocket(cpus = detectCores() - 1)
+
+gamModel <- train(gamFeatSelWrapper, gamTask)
+
+parallelStop()
+
+gamModelData <- getLearnerModel(gamModel, more.unwrap = TRUE)
+```
+
+Now, let's understand our model a little better by plotting the functions it learned for each of the predictor variables. This is as easy as calling `plot()` on our model information. We can also look at the residuals from the model by extracting them with the `resid()` function. This allows us to plot the predicted value (by extracting the `$fitted()` component) against their residuals to look for patterns that suggest a poor fit. We can also plot the quantiles of the residuals against the quantiles of a theoretical normal distribution, using `qqnorm()` & `qqline()`, to see if they are normally distributed.
+
+```{r}
+par(mfrow = c(3, 3))
+plot(gamModelData, type = 'l')
+plot(gamModelData$fitted(), resid(gamModelData))
+qqnorm(resid(gamModelData))
+qqline(resid(gamModelData))
+par(mfrow = c(1, 1))
+```
+
+For each predictor, we get a plot of its value against how much that predictor contributes to the ozone estimate across its values. Lines show the shape of the functions learned by the algorithm & we can see that they are all nonlinear. Finally, looking at the residual plots, we can see a slightly curved pattern, which may indicate heteroscedasticity in the data. We could try training the model on a transformed `Ozone` variable (such as log transformation) to see if this helps, or use a model that doesn't make a homoscedasticity assumption. The quantile plot shows that most of the residuals lie close to the diagonal line, indicating that they approximate a normal distribution, with some deviation at the tails (which isn't uncommon).
+
+
+***
+
+
+# Strengths & Weaknesses of GAMs
+
+The strengths of GAMs are as follows:
+
+* They produce models that are very interpretable, despite being nonlinear.
+* They can handle both continuous & categorical predictors.
+* They can automatically learn nonlinear relationships in the data.
+
+The weaknesses of GAMs are as follows:
+
+* They still make strong assumptions about the data, such as homoscedasticity & the distribution of residuals (performance may suffer if these are violated).
+* GAMs have a propensity to overfit the training set.
+* GAMs can be particularly poor at predicting data outside the range of values of the training set.
+* They cannot handle missing data.
+
+
+***
+
+
+# Summary
+
+* Polynomial terms can be included in linear regression to model nonlinear relationships between the predictor variables & the outcome.
+* Generalised additive models (GAMs) are supervised learners for regression problems that can handle continuous & categorical predictors.
+* GAMs use the equation of a straight line, but allow nonlinear relationships between the predictor variables & the outcome.
+* The nonlinear functions learned by GAMs are often splines created from thesum of a series of basis functions.

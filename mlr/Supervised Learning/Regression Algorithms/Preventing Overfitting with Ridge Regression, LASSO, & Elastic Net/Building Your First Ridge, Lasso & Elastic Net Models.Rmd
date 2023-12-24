@@ -1,0 +1,358 @@
+---
+title: "Building Your First Ridge, LASSO, & Elastic Net Models"
+author: "Jie Heng Yu"
+date: "3/25/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(parallel)
+library(parallelMap)
+library(plotly)
+```
+
+
+# Building Your First Ridge, LASSO, & Elastic Net Models
+
+Imagine that we're trying to estimate the market price of wheat for the coming year in Iowa. The market price depends on the yield for that particular year, so we're trying to predict the yield of wheat from rain & temperature measurements.
+
+We'll start by loading & exploring the dataset. (`Iowa` dataset, from the `lasso2` package is no longer available, because the `lasso2` package has been removed from CRAN. Thus, we'll be reading in the data from a CSV file.)
+
+```{r}
+iowaTib <- as_tibble(read.csv('Iowa.csv'))
+iowaTib
+```
+
+We have a tibble containing 33 cases & 10 varaibles of various rainfall & temperature measurements, the year, & the wheat yield.
+
+Let's plot the data to get a better understanding of the relationships within it. We'll use our usual trick of gathering the data so we can facet by each variable, supplying `'free_x'` as the `scales` argument to allow the x-axis to vary between facets. To get an indication as to any linear relationships with `Yield`, we'll also apply a `geom_smooth()` layer, using `lm` as the argument to `method` to get linear fits.
+
+```{r}
+iowaUntidy <- gather(iowaTib, 'Variable', 'Value', -Yield)
+
+ggplotly(
+  ggplot(iowaUntidy, aes(Value, Yield)) +
+    facet_wrap(~Variable, scales = 'free_x') +
+    geom_point() +
+    geom_smooth(method = 'lm') +
+    theme_bw()
+)
+```
+
+It looks as though some of the variables correlate with `Yield`, but notice that because we don't have a large number of cases, only 33, the slopes of some of these relationships could drastically change if we only removed a couple of cases near the extremes of the x-axis. For example, would the slope between `Rain2` & `Yield` be nearly as steep if we hadn't measured those three cases with the highest rainfall? We will need regularisation to prevent overfitting for this data set.
+
+
+### Training the Ridge Regression Model
+
+Let's define our task & learner, this time supplying `'regr.glmnet'` as the argument to `makeLearner()`. Handily, the `glmnet` function (from the package of the same name) allows us to create ridge, LASSO, & elastic net models using the same function. Notice that we set the value of *alpha* equal to 0 here. We also supply the `id` argument, letting us supply a unique name to every learner. The reason is for later, when we benchmark our ridge, LASSO, & elastic net learners against each other. Because we create each of these learners with the same `glmnet` function, we'll get an error because they won't each have a unique identifier.
+
+```{r, warning = FALSE}
+iowaTask <- makeRegrTask(data = iowaTib, target = 'Yield')
+ridge <- makeLearner('regr.glmnet', alpha = 0, id = 'ridge')
+```
+
+Let's get an idea of how much each predictor would contribute to a model's ability to predict `Yield`. We can use the `generateFilterValuesData()` & `plotFilterValues()` functions when performing feature selection using the filter method.
+
+```{r, warning = FALSE}
+filterVals <- generateFilterValuesData(iowaTask)
+filterVals
+plotFilterValues(filterVals) + theme_bw()
+```
+
+It seems like all of our variables provide about equal predictive information bout `Yield`. There are no negative contributions, which would suggest that including them in the model will be to the detriment of predictive accuracy.
+
+We will not be performing feature selection. Instead, we'll enter all the predictors & let the algorithm shrink the ones that contribute less to the model. The first thing we need to do is tune the *lambda* hyperparameter that controls just how big a penalty to apply to the parameter estimates.
+
+We'll start by defining the hyperparameter space we're going to search to find the optimal value of *lambda*. Recall that to do this, we use the `makeParamSet()` function, supplying each of our hyperparameters to search, separated by commas. Because we only have one hyperparameter to tune, & becase *lambda* can take any numeric value between 0 & infinity`, we use the `makeNumericParam()` function to specify that we want to search for numeric values of *lambda* between 0 & 15. **Note: we will call the hyperparameter `'s'` instead of `lambda`. This is because it will build models for a range of *lambdas* for us. Then we can plot the *lambdas* to see which one gives the best cross-validated performance. For more information, read the documentation for glmnet.**
+
+Next, we'll define our search method as a random search with 200 iterations using `makeTuneControlRandom()` & define our cross-validation method as 3-fold cross-validation repeated 5 times, using `makeResampleDesc()`. Finally, we run our hyperparameter tuning process with the `tuneParams()` function. To speed things up a little, we'll parallelise the search.
+
+```{r, message = FALSE}
+ridgeParamSpace <- makeParamSet(
+  makeNumericParam('s', lower = 0, upper = 15)
+)
+randSearch <- makeTuneControlRandom(maxit = 200)
+
+cvForTuning <- makeResampleDesc('RepCV', folds = 3, reps = 10)
+
+parallelStartSocket(cpus = detectCores() - 1)
+tunedRidgePars <- tuneParams(ridge, task = iowaTask, resampling = cvForTuning,
+                             par.set = ridgeParamSpace, control = randSearch)
+parallelStop()
+
+tunedRidgePars
+```
+
+Our tuning process selected approximately 7 as the best-performing *lambda*. But how can we be sure we search over a large enough range of *lambdas*? We can plot each value of *lambda* against the mean MSE of its models & see if it looks like there may be a better value outside of our search space.
+
+First, we extract the *lambda* & mean MSE values for each iteration of the random search by supplying our tuning object as the argument to the `generateHyperParsEffectData()` function. Then, we supply this data as the first argument of the `PlotHyperParsEffect()` function & tell it we want to plot the values of *s* on the x-axis & the mean MSE (`'mse.test.mean'`) on the y-axis, & that we want a line that connects the data points.
+
+```{r}
+ridgeTuningData <- generateHyperParsEffectData(tunedRidgePars)
+plotHyperParsEffect(ridgeTuningData, x = 's', y = 'mse.test.mean',
+                    plot.type = 'line') +
+  theme_bw()
+```
+
+We can see that the MSE is minimise for *lambdas* somewhere between 5 & 7.5, & it seems anything beyond 7.5 results in models that perform worse. If the MSE seemed to be still decreasing at the edge of our search space, we would need to expand the search in case we're missing better hyperparameter values. Because we appear to be at the minimum, we will stop our search.
+
+Now that we think we've selected the best-performing value of *lambda*, we'll train a model using that value. First, we use the `setHyperPars()` function to define a new learner using our tuned `lambda` value. Then, we use the `train()` function to train the model on our `iowaTask`.
+
+```{r}
+tunedRidge <- setHyperPars(ridge, par.vals = tunedRidgePars$x)
+tunedRidgeModel <- train(tunedRidge, iowaTask)
+tunedRidgeModel
+```
+
+One of the main motivations for using linear models is that we can interpret the slopes to get an idea of how much the outcome variable changes with each predictor. So let's extract the parameter estimates from our ridge regression model. First, we extract the model data using the `getLearnerModel()` function. Then, we use the `coef()` function to extract the parameter estimates. Note that because of the way glmnet works, we need to supply the value of *lambda* to get the parameters for that model.
+
+When we print `ridgeCoefs`, we get a matrix containing the name of each parameter & its slope. The intercept is the estimated `Yield` when all the predictors are 0. Of course, it doesn't make much sense to have negative wheat yield, but because it doesn't make sense for all the predictors to be 0 (such as the year), we won't interpret this. We're more interested in interpreting the slopes, which are reported on the predictor's original scale. We can see that for every additional year, wheat yield increased by approximately 0.5 bushels per acre. For each one-inch increase in `Rain1`, wheat yield *decreased* by approximately 0.7, & so on.
+
+```{r}
+ridgeModelData <- getLearnerModel(tunedRidgeModel)
+ridgeCoefs <- coef(ridgeModelData, s = tunedRidgePars$x$s)
+ridgeCoefs
+```
+
+Let's plot these parameter estimates against the estimates from unregularise linear regression, so we can see the effect of parameter shrinkage. First, we need to train a linear model using OLS. We could do this with mlr, but as we're not going to do anything fancy with this model, we can create on quickly using the `lm()` function. The first argument to `lm()` is the formula `Yield ~ .`, which means `Yield` is our outcome variable, & we want to model it (~) using all other variables in the data (.). We tell the function where to find the data, & wrap the whole `lm()` function inside the `coef()` function to extract its parameter estimates.
+
+Next, we create a tibble containing three variables:
+
+* The parameter names
+* The ridge regression parameter values
+* The `lm` parameter values
+
+Because we want to exclude the intercepts, we use `[-1]` to subset all the parameters except the first one (the intercept).
+
+So that we can facet by model, we `gather()` the data & then plot it using `ggplot()`. Because it's nice to see things in ascending & descending order, we supply `reorder(Coef, Beta)`, which will use the `Coef` variable as the x aesthetic ordered by the `Beta` variable. By default, `geom_bar()` tries to plot frequencies, but because we want bars to represent the actual value of each parameter, we set the `stat = 'identity'` argument.
+
+```{r}
+lmCoefs <- coef(lm(Yield ~ ., data = iowaTib))
+coefTib <- tibble(Coef = rownames(ridgeCoefs)[-1],
+                  Ridge = as.vector(ridgeCoefs)[-1],
+                  Lm = as.vector(lmCoefs)[-1])
+coefUntidy <- gather(coefTib, key = Model, value = Beta, -Coef)
+
+ggplotly(
+  ggplot(coefUntidy, aes(reorder(Coef, Beta), Beta, fill = Model)) +
+    geom_bar(stat = 'identity', col = 'black') +
+    facet_wrap(~Model) +
+    theme_bw() +
+    theme(legend.position = 'none',
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+)
+```
+
+In the left facet, we have the parameter estimates for the unregularised model, & in the right facet, we have the estimates for our ridge regression model. We can see that most of the ridge regression parameters are smaller than those for the unregularised model. This is the effect of regularisation.
+
+
+### Training the LASSO Model
+
+We start by defining the LASSO learner, this time setting *alpha* equal to 1 (to make it pure LASSO). We give the learner an ID, which we'll use when we benchmark the models later.
+
+```{r}
+lasso <- makeLearner('regr.glmnet', alpha = 1, id = 'lasso')
+```
+
+Now, let's tune *lambda* as we did before ridge regression.
+
+```{r, message = FALSE}
+lassoParamSpace <- makeParamSet(
+  makeNumericParam('s', lower = 0, upper = 15)
+)  
+  
+parallelStartSocket(cpus = detectCores() - 1)
+tunedLassoPars <- tuneParams(lasso, task = iowaTask, resampling = cvForTuning,
+                             par.set = lassoParamSpace, control = randSearch)
+parallelStop()
+  
+tunedLassoPars
+```
+
+Now we plot the tuning process to see if we need to expand our search.
+
+```{r}
+lassoTuningData <- generateHyperParsEffectData(tunedLassoPars)
+plotHyperParsEffect(lassoTuningData, x = 's', y = 'mse.test.mean',
+                    plot.type = 'line') +
+  theme_bw()
+```
+
+Once again, we see that the selected value of *lambda* falls at the bottom of the value of mean MSE values. Notice that the mean MSE flat-lines after *lambda* values of 10. This is because the penalty is so large that all the predictors have been removed from the model & we get the mean MSE of an intercept-only model.
+
+Let's train a LASSO model using our tuned value of *lambda*.
+
+```{r}
+tunedLasso <- setHyperPars(lasso, par.vals = tunedLassoPars$x)
+tunedLassoModel <- train(tunedLasso, iowaTask)
+tunedLassoModel
+```
+
+Now let's look at the parameter estimates from our tuned LASSO model & see how they compare to the ridge & OLS estimates. Once again, we use the `getLearnerModel()` function to extract the model data & then the `coef()` function to extract the parameter estimates. Notice some of our parameter estimates are dots. These dots represent 0.0. The slopes of these parameters in the data set have been set to exactly 0. This means they have been removed from the model completely. This is how LASSO can be used for performing feature selection.
+
+```{r}
+lassoModelData <- getLearnerModel(tunedLassoModel)
+lassoCoefs <- coef(lassoModelData, s = tunedLassoPars$x$s)
+lassoCoefs
+```
+
+Let's plot these parameter estimates alongside those from our ridge & OLS models to give a more graphical comparison. To do this, we simply add a new column to our `coefTib` tibble using `$LASSO`; it contains the parameter estimates from our LASSO model (excluding the intercept). We then gather this data so we can facet by model, & plot it as before using `ggplot()`.
+
+```{r}
+coefTib$LASSO <- as.vector(lassoCoefs)[-1]
+coefUntidy <- gather(coefTib, key = Model, value = Beta, -Coef)
+
+ggplotly(
+  ggplot(coefUntidy, aes(reorder(Coef, Beta), Beta, fill = Model)) +
+    geom_bar(stat = 'identity', col = 'black') +
+    facet_wrap(~ Model) +
+    theme_bw() +
+    theme(legend.position = 'none',
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+)
+```
+
+The plot nicely highlights the difference between ridge, which shrinks parameters toward 0 (but never actually to 0), & LASSO, which can shrink parameters to exactly 0.
+
+
+### Training the Elastic Net Model
+
+We start by creating an elastic net learner; this time we won't supply a value of *alpha*, because we're going to tune it to find the best trade-off between L1 & L2 regularisation. We also give it an ID that we can use later when benchmarking.
+
+```{r}
+elastic <- makeLearner('regr.glmnet', id = 'elastic')
+```
+
+Now let's define the hyperparameter space we're going to tune over, this time with *lambda* as a numeric hyperparameter bounded between 0 & 10; *alpha* as a numeric hyperparameter bounded between 0 & 1. Because we're now tuning two hyperparameters, let's increase the number of iterations of our random search to get a little more coverage of the search spave. Finally, we run the tuning process as before & print the optimal result.
+
+```{r, message = FALSE}
+elasticParamSpace <- makeParamSet(
+  makeNumericParam('s', lower = 0, upper = 10),
+  makeNumericParam('alpha', lower = 0, upper = 1)
+)
+randSearchElastic <- makeTuneControlRandom(maxit = 400)
+
+parallelStartSocket(cpus = detectCores() - 1)
+tunedElasticPars <- tuneParams(elastic, task = iowaTask, 
+                               resampling = cvForTuning,
+                               par.set = elasticParamSpace, 
+                               control = randSearchElastic)
+parallelStop()
+
+tunedElasticPars
+```
+
+Now let's plot our tuning process to confirm that our search space was large enough. This time, because we are tuning two hyperparameters simultaneously, we supply *lambda* & *alpha* as the x- & y-axes, & meanMSE (`'mse.test.mean'`) as the z-axis. Setting the `plot.type` argument equal to `'heatmap'` will draw a heatmap where the colour is mapped to whatever we set as the z-axis. For this to work though, we need to fill in the gaps between our 1000 search iterations. To do this, we supply the name of any regression algorithm to the `interpolate` argument. Here, we use `'regr.kknn'` which uses k-nearest neighbours to fill in the gaps based on the MSE values of the nearest search iterations. We add a single `geom_point()` to the plot to indicate the combination of *lambda* & *alpha* that were selected by our tuning process.
+
+```{r, message = FALSE}
+elasticTuningData <- generateHyperParsEffectData(tunedElasticPars)
+
+plotHyperParsEffect(elasticTuningData, x = 's', y = 'alpha',
+                    z = 'mse.test.mean', interpolate = 'regr.kknn',
+                    plot.type = 'heatmap') +
+  scale_fill_gradientn(colours = terrain.colors(5)) +
+  geom_point(x = tunedElasticPars$x$s, y = tunedElasticPars$x$alpha,
+             col = 'white') +
+  theme_bw()
+```
+
+Notice that the selected combination of *lambda* & *alpha* (the white dot) falls in a valley of mean MSE values, suggesting our hyperparameter search space was wide enough.
+
+Let's train the final elastic net model using our tuned hyperparameters.
+
+```{r}
+tunedElastic <- setHyperPars(elastic, par.vals = tunedElasticPars$x)
+tunedElasticModel <- train(tunedElastic, iowaTask)
+tunedElasticModel
+```
+
+Next, we can extract the model parameters & plot them along the other three models.
+
+```{r}
+elasticModelData <- getLearnerModel(tunedElasticModel)
+elasticCoefs <- coef(elasticModelData, s = tunedElasticPars$x$s)
+coefTib$Elastic <- as.vector(elasticCoefs)[-1]
+
+coefUntidy <- gather(coefTib, key = Model, value = Beta, -Coef)
+
+ggplotly(
+  ggplot(coefUntidy, aes(reorder(Coef, Beta), Beta, fill = Model)) +
+    geom_bar(stat = 'identity', position = 'dodge', col = 'black') +
+    facet_wrap(~ Model) +
+    theme_bw() +
+    theme(legend.position = 'none',
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+)
+```
+
+
+***
+
+# Benchmarking Ridge, LASSO, Elastic Net & OLS Against Each Other
+
+Let's use benchmarking to simultaneously cross-validate & compare the performance of our ridge, LASSO, elastic net, & OLS modeling processes. Recall that benchmarking takes a list of learners, a task, & a cross-validation procedure. Then, for each iteration/fold of the cross-validation process, a model is trained using each learner on the same training set, & evaluated on the same test set. Once the entire cross-validation process is complete, we get the mean performance metric (MSE) for each learner, allowing us to compare which would perform best.
+
+We start by defining tuning wrapper for each learner so we can include hyperparameter tuning inside our cross-validation loop. For each wrapper (one each for ridge, LASSO, & elastic net), we supply the learner, cross-validation strategy, the parameter space for that learner, & the search procedure for that learner (notice the different search procedure for elastic net). OLS regression doesn't need hyperparameter tuning, so we don't make a wrapper for it. Because the `benchmark()` function requires a list of learners, we next create a list of these wrapper (& `'regr.lm'`, our OLS regression learner).
+
+```{r}
+ridgeWrapper <- makeTuneWrapper(ridge, resampling = cvForTuning,
+                                par.set = ridgeParamSpace,
+                                control = randSearch)
+lassoWrapper <- makeTuneWrapper(lasso, resampling = cvForTuning,
+                                par.set = lassoParamSpace,
+                                control = randSearch)
+elasticWrapper <- makeTuneWrapper(elastic, resampling = cvForTuning,
+                                  par.set = elasticParamSpace,
+                                  control = randSearchElastic)
+learners <- list(ridgeWrapper, lassoWrapper, elasticWrapper, 'regr.lm')
+```
+
+To run the benchmarking experiment, let's define our outer resampling strategy to be 3-fold cross-validation. After starting parallelisation, we run the benchmarking experiment by supplying the list of learners, task, & outer cross-validation strategy to the `benchmark()` experiment.
+
+```{r, message = FALSE}
+kFold3 <- makeResampleDesc('CV', iters = 3)
+
+parallelStartSocket(cpus = detectCores() - 1)
+bench <- benchmark(learners, iowaTask, kFold3)
+parallelStop()
+
+bench
+```
+
+Perhaps, surprisingly, ridge, LASSO, & elastic net performed almost equally, although all three regularisation techniques outperformed OLS regression. Because elastic net has the potential to select both pure ridge or pure LASSO (based on the value of the *alpha* hyperparameter), increasing the number of iterations of the random search could end up putting elastic net on top.
+
+
+***
+
+# Strengths & Weaknesses of Ridge, LASSO, & Elastic Net
+
+The strengths of ridge, LASSO, & elastic net are the following:
+
+* They produce models that are very interpretable.
+* They can handle both continuous & categorical predictors.
+* They are computationally inexpensive.
+* They often outperform OLS regression.
+* LASSO & elastic net can perform feature selection by setting the slopes of uninformative predictors equal to 0.
+* They can also be applied to generalised linear models (such as logistic regression).
+
+The weaknesses of ridge, LASSO, & elastic net are the following:
+
+* They make strong assumptions about the data, such as homoscedasticity (constant variance) & the distribution of residuals (performance may suffer if these are violated).
+* Ridge regression cannot perform feature selection automatically.
+* LASSO cannot estimate more parameters than cases in the training set.
+* They cannot handle missing data.
+
+
+***
+
+# Summary
+
+* Regularisation is a set of techniques that prevents overfitting by shrinking model parameter estimates.
+* There are three regularisation techniques for linear models:  ridge regression, LASSO, & elastic net.
+* Ridge regression uses the L2 norm to shrink parameter estimates toward 0 (but never exactly 0, unless they were 0 to begin with).
+* LASSO uses the L1 norm to shrink parameter estimates toward 0 (& possibly exactly to 0, resulting in feature selection).
+* Elastic net combines both L2 & L1 regularisation, the ratio of which is controlled by the *alpha* parameter.
+* For all three, the *lambda* hyperparameter controls the strength of shrinkage.
