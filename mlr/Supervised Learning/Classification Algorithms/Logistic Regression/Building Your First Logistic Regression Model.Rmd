@@ -1,0 +1,257 @@
+---
+title: "Building Your First Logistic Regression Model"
+author: "Jie Heng Yu"
+date: "12/7/2022"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(titanic) # titanic_train & titanic_test data sets
+```
+
+
+# Building Your First Logistic Regression Model
+
+Imagine that you're a historian interested in the RMS Titanic, which famously sank in 1912 after colliding with an iceberg. You want to know whether socioeconomic factors influenced a person's probability of surviving the disaster. Our aim is to build a binomial logistic regression model to predict whether a passenger would survive the *Titanic* disaster, based on data such as their gender & how much they paid for their ticket. We're also going to interpret the model to decide which variables are important in influencing the probability of a passenger surviving.
+
+
+### Loading & Exploring the Titanic Dataset
+
+```{r}
+titanicTib <- as_tibble(titanic_train)
+head(titanicTib)
+summary(titanicTib)
+```
+
+* **PassengerId** - Arbitrary number unique to each passenger
+* **Survived** - Integer denoting survival (1 = survived, 0 = died)
+* **Pclass** - Passenger class (first, second, third)
+* **Name** - Passenger name
+* **Sex** - Male or female
+* **Age** - Age of passenger
+* **SibSp** - Combined number of siblings & spouses on board
+* **Parch** - Combined number of parents & children on board
+* **Ticket** - Passenger's ticket number
+* **Fare** - Amount of money passenger paid for their ticket
+* **Cabin** - Passenger's cabin number
+* **Embarked** - Which port passengers embarked from
+
+Very rarely do we work with a data set that is ready for modeling straight away. Typically, we need to perform some cleaning first to ensure we get the most from the data. For this data set, we will perform 3 tasks.
+
+1. Convert the `Survived`, `Sex` & `Pclass` variables into factors.
+2. Create a new variable called `FamSize` by adding `SibSp` & `Parch` together.
+3. Select the variables we believe to be of predictive value for our model.
+
+```{r}
+fctrs <- c("Survived", "Sex", "Pclass") # Define variables we wish to convert into factors
+
+titanicClean <- titanicTib %>%
+  mutate_at(.vars = fctrs, .funs = factor) %>% # supply existing variables to `.vars` & tell it what we want to do to those variables using `.funs`
+  mutate(FamSize = SibSp + Parch) %>%
+  select(Survived, Pclass, Sex, Age, Fare, FamSize)
+
+head(titanicClean)
+```
+
+Now that we cleaned our data a little, we can plot it to get a better insight into the relationships in the data. A little trick to simplify plotting multiple variables together is to convert the data into an untidy format, such that each of the predictor variables is held in one column, & its values are held in another column, using the `gather()` function.
+
+```{r, warning = FALSE}
+titanicUntidy <- gather(titanicClean, key = "Variable", value = "Value", -Survived)
+head(titanicUntidy)
+```
+
+```{r, warning = FALSE}
+titanicUntidy %>%
+  filter(Variable != "Pclass" & Variable != "Sex") %>%
+  ggplot(aes(Survived, as.numeric(Value))) +
+  facet_wrap(~Variable, scales = "free_y") +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_boxplot(width = 0.1) +
+  labs(x = "Survived", y = "Values", title = "Survival by Age, Family Size, & Amount Paid for Ticket") +
+  theme_bw()
+
+titanicUntidy %>%
+  filter(Variable == "Pclass" | Variable == "Sex") %>%
+  ggplot(aes(x = Value, fill = Survived)) +
+  facet_wrap(~Variable, scales = "free_x") +
+  geom_bar(position = "fill") +
+  labs(x = "Values", y = "Proportion", title = "Survival Proportions by Class & Sex") +
+  theme_bw()
+```
+
+Based off our plots, it seems like passengers who survived tended to have slightly more family members on board, although passengers with very large families on board tended not to survive. Age does not seem to have any obvious impact on survival,but being female meant you were much more likely to survive. Paying more for your fare increased probability of survival, as did being in a higher class (though the two probably correlate).
+
+
+### Training the Model
+
+Now that we've cleaned our data, we can create a task, learner, & model with mlr, specifying `"classif.logreg"` to use logistic regression as our learner. By setting the argument `predict.type = "prob"`, the trained model will output the estimated probabilities of each class when making predictions on new data, rather than just the predicted class membership.
+
+```{r}
+# titanicTask <- makeClassifTask(data = titanicClean, target = "Survived")
+# logReg <- makeLearner("classif.logreg", predict.type = "prob")
+# logRegModel <- train(logReg, titanicTask)
+```
+
+The above code throws an error. The error message states that there are missing values in the `Age` variable, & the logistic regression algorithm doesn't know how to handle that.
+
+```{r}
+sum(is.na(titanicClean$Age))
+```
+
+There are a lot of missing values (NA), 117 in fact.
+
+
+### Dealing with Missing Data
+
+There are two ways to handle missing data.
+
+1. Simply exclude cases with missing data from the analysis.
+2. Apply an *imputation* mechanism to fill in the gaps.
+
+The first option may be valid when the ratio of cases with missing values to complete cases is very small. In that case, omitting cases with missing data is unlikely to havea large impact on the performance of our model. It is a simple, if not elegant, solution to the problem.
+
+The second option, missing value imputation, is the process by which we use some algorithm to estimate what those missing values would have been, replace the NAs with those estimates, & use the imputed data set to train the mode. There are many different ways of estimating the values of missing data, but for now, we will employ missing value imputation, where we simply take the mean of the variable with missing data & replace missing values with that.
+
+We will use mlr's `impute()` function to replace the missing data. The first argument is the name of the data, & the `cols` argument asks us which columns we want to input & what method we want to apply. We supply the `cols` argument as a list of column names, separated by commas if we want have more than one. Each column listed should be followed by an `=` sign & the imputation method (`imputedMean()` uses the mean of the variable to replace NAs). I save the imputed data structure as an object, `imp`, & use `sum(is.na())` to count the number of missing values from the data.
+
+```{r}
+imp <- impute(titanicClean, cols = list(Age = imputeMean()))
+sum(is.na(titanicClean$Age))
+sum(is.na(imp$data$Age))
+```
+
+Now that we've imputed the missing values with the mean & created the new object `imp`, we can try training the model again. The `imp` object contains both the imputed data & a description for the imputation process we used. To extract the data, we simply use `imp$data`.
+
+```{r}
+titanicTask <- makeClassifTask(data = imp$data, target = "Survived")
+logReg <- makeLearner("classif.logreg", predict.type = "prob")
+logRegModel <- train(logReg, titanicTask)
+```
+
+
+***
+
+
+# Cross-Validating the Logistic Regression Model
+
+Recall that when we cross-validate, we should cross-validate our entire model-building procedure. This should include any data dependent preprocessing steps, such as missing value imputation.
+
+The `makeImputeWrapper()` function wraps together a learner (given as the first argument) & an imputation method. We specify the imputation method in the same ways as for the `impute()` function, by supplying a list of columns & their imputation method.
+
+```{r}
+logRegWrapper <- makeImputeWrapper("classif.logreg",
+                                   cols = list(Age = imputeMean()))
+```
+
+Because we're supplying our wrapped learner to the `resample()` function, for each fold of the cross-validation, the mean of the `Age` variable in the training set will be used to impute any missing values.
+
+```{r, message = FALSE}
+kFold <- makeResampleDesc(method = "RepCV", folds = 10, reps = 50, 
+                          stratify = TRUE)
+logRegImpute <- resample(logRegWrapper, titanicTask, 
+                         resampling = kFold,
+                         measure = list(acc, fpr, fnr))
+```
+
+```{r}
+logRegImpute
+```
+
+As this is a two-class classification problem, we have access to a few extra performance metrics, such as false positive rate (`fpr`) & false negative rate (`fnr`). In the cross-validation procedure we ask for accuracy, false positive rate, & false negative rate to be reported as performance metrics. We can see that although on average across the repeats, our model correctly classified approximately 79.6% of passengers. It incorrectly classified approximately 29.9% of passengers who died as having survived (false positives), & incorrectly classified approximately 14.4% of passengers who survived as having died (false negatives).
+
+
+### Accuracy as the Most Important Performance Metric
+
+One might think that the accuracy of a model's predictions is the defining metric of its performance. Often, this is the case, but sometimes, it is not.
+
+Imagine you work for a bank as a data scientist in the fraud-detection department. It is your job to build a model that predicts whether credit card transactions are legitimate or fraudulent. Let's say that out of 100,000 credit card transactions, only 1 is fraudulent. Because fraud is relatively rare, you decide to classify all transactions as legitimate. 
+
+The resulting model accuracy is 99.999%. Good, no? Of course not! The model isn't ablle to identify any fraudulent transactions & has a false negative rate of 100%.
+
+The lesson here is that you should evaluate model performance in the context of your particular problem. Another example could be building amodel that will guide doctors to use an unpleasant treatment, or not, for a patient. In the context of the problem, it may be acceptable to incorrectly not give a patient the unpleasant treatment, but it is imperative that you don't incorrectly give a patient the treatment if they don't need it!
+
+If positive events are rate (as in our fraudulent credit card example), or if it is particularly important that you don't misclassify positive cases as negative, you should favor models that have a low false negative rate. If negative events are rate, or if it is particularly important that you don't misclassify negative cases as positive (as in our medical treatment example), you should favour models that have low false positive rates.
+
+
+### Interpreting the Model: Odds Ratios
+
+One of the reasons why logistic regression is so popular is because of how interpretable the model parameters (y-intercept & slopes of each predictor) are. To extract model parameters, we must first turn our mlr model object, `logRegModel`, into an R object using the `getLearnerModel()` function. Next, we pass this R model object as the argument to the `coef()` function, which stands for *coefficients*, so this function returns the model parameters.
+
+```{r}
+logRegModelData <- getLearnerModel(logRegModel)
+coef(logRegModelData)
+```
+
+The intercept is the log odds of surviving the *Titanic* disaster when all continuous variables are 0 & the factors are at their reference levels. We tend to be more interested in the slopes than the y-intercept, but these values are in log odds units, which are difficult to interpret. Instead, people commonly convert them into *odds ratios*.
+
+An odds ratio is a ratio of odds. For example, if the odds of surviving the *Titanic* if you are a female are 7 to 10, & the odds of survivng if you are a male is 2 to 10, then the odds ratio for survivng if you're female compared to a male is 3.5. In other words, you are 3.5 times more likely to survive than if you were a female than if you were a male.
+
+How do we get from log odds to odds ratios? By taking their exponent ($e^{log~ odds}$). We can also calculate 95% confidence intervals using the `confint()` function, to help us decide how strong the evidence is that each variable has predictive value.
+
+```{r}
+exp(cbind(Odds_Ratio = coef(logRegModelData), confint(logRegModelData)))
+```
+
+Most of the odds ratios are less than 1. An odds ratio less than 1 means an event is less likely to occur than to occur. It's unusually easier to interpret these value if you divide 1 by them. For example, the odds ratio for surviving if you were a male is 0.06, & 1 divided by 0.6 is approximately 16.7. This means that, holding all other variables constant, men were 16.7 times less likely to survive than women.
+
+For continuous variables, we interpret the odds ratio as how much more likely a passenger is to survive for every one-unit increase in the variable. For example, for every additional family member, a passenger was 1/0.78 = 1.28 times less likely to survive.
+
+For factors, we interpret the odds ratio as how much more likely a passenger is to survive, compared to the reference level for that variable. For example, a passenger in class 2 has 0.367 chance of survival compared to that of a passenger in class 1, i.e.a class 2 passenger is 1/0.367 = 2.72 times less likely to survive compared to a passenger in class 1. A passenger in class 3 has 0.119 chance of survival compared to that of a passenger in class 1, i.e. a class 3 passenger is 1/0.119 = 8.40 times less likely to survive compared to a class 1 passenger.
+
+The 95% confidence intervals indicate the strength of the evidence that each variable has predictive value. An odds ratio of 1 means the odds are equal & the variable has no impact on prediction. Therefore, if the 95% CI includes the value 1, such as those for the `Fare` variable, then this may suggest that this variables isn't contributing anything.
+
+
+***
+
+
+# Using our Model to Make Predictions
+
+We've built, cross-validated, & interpreted our model, & now it would be nice if we could use the model to make predictions on new data. Let's load some unlabeled passenger data, clean it for prediction, & pass it through our model.
+
+```{r}
+titanicNew <- as_tibble(titanic_test)
+head(titanicNew)
+
+titanicNewClean <- titanicNew %>%
+  mutate_at(.vars = c("Sex", "Pclass"), .funs = factor) %>%
+  mutate(FamSize = SibSp + Parch) %>%
+  select(Pclass, Sex, Age, Fare, FamSize)
+head(titanicNewClean)
+```
+
+```{r}
+predict(logRegModel, newdata = titanicNewClean)
+```
+
+
+***
+
+
+# Strengths & Weaknesses of Logistic Regression
+
+The strengths of the logistic regression algorithm are as follows:
+
+* It can handle both continuous & categorical predictors.
+* The model parameters are very interpretable.
+* Predictor variables are not assumed to be normally distributed.
+
+The weaknesses of the logistic regression algorithm are these:
+
+* It won't work when there is complete separation between classes.
+* It assumes that the classes are linearly separable. In other words, it assumes that a flat surface in n-dimensional space (where n is the number of predictors) can be used to separate the classes. If a curved surface is required to separate the classes, the logistic regression will underperform compared to some other algorithms.
+* It assumes a linear relationship between each predictor & the log odds. If, for example, cases with low & high values of a predictor belong to one class, but cases with medium values of the predictor below to another class, this linearity will break down.
+
+
+***
+
+
+# Summary
+
+* Logisitic regression is a supervised learning algorithm that classifies new data by calculating the probabilities of the data belonging to each class.
+* Logistic regression can handle continuous & categorical predictors, & models a linear relationship between the predictors & the log odds of belonging to the positive class.
+* Feature selection is the process of choosing which variables in a dataset have predictive value for machine learning models.
+* Imputation is a strategy for dealing with missingdata, where some algorithm is used to estimate what the missing values would have been. 
+* Odds ratios are an informative way of interpreting the impact each of our predictors has on a case belonging to the positive class. They can be calculated by taking the exponent of the model slopes ($e^{log~odds}$).

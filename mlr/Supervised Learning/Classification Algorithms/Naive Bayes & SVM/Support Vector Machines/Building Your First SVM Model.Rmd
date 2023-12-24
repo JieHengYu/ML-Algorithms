@@ -1,0 +1,210 @@
+---
+title: "Building Your First SVM Model"
+author: "Jie Heng Yu"
+date: "2/3/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(plotly)
+library(parallel) # multithreading
+library(parallelMap) # multithreading
+```
+
+
+# Building Your First SVM Model
+
+Imagine that we're sick && tired of receiving so many spam emails. It's difficult for us to be productive when we have so many emails requesting your bank details for a mysterious Ugandan inheritance & trying to sell us viagra. We decide to perform a feature extraction on the emails we receive over a few months, which we manually classify as spam or not spam. These features include things like the number of exclamation marks & the frequency of certain words. With this data, we want to make an SVM that we can use as a spam filter, which will classify new emails as spam or not spam.
+
+We'll start by loading & exploring the data set.
+
+```{r}
+data(spam, package = 'kernlab')
+spamTib <- as_tibble(spam)
+spamTib
+```
+
+We have a tibble containing 4,601 emails & 58 variables extracted from emails. Our goal is to train a model that can use the information in these variables to predict whether a new email is spam or not.
+
+
+### Tuning our Hyperparameters
+
+Let's define our task & learner. This time, we supply `"classif.csv"` as the argument to `makeLearner()` to specify that we're going to use SVM.
+
+```{r, warning = FALSE}
+spamTask <- makeClassifTask(data = spamTib, target = 'type')
+svm <- makeLearner('classif.svm')
+```
+
+Before we train our model, we need to tune our hyperparameters. To find out which hyperparameters are available for tuning for an algorithm, we simply pass the name of the algorithm in quotes to `getParamSet()`. 
+
+```{r}
+getParamSet('classif.svm')
+```
+
+These are the most important hyperparameters for us to tune:
+
+* *Kernel*
+* *Cost*
+* *Degree*
+* *Gamma*
+
+We will start by defining a vector of kernel functions we wish to tune.
+
+```{r}
+kernels <- c('polynomial', 'radial', 'sigmoid')
+```
+
+Next, we use the `makeParamSet()` function to define the hyperparameter space we wish to tune over. To the `makeParamSet()` function, we supply the information needed to define each hyperparameter we wish to tune, separated by commas. Let's break this down.
+
+```{r}
+svmParamSpace <- makeParamSet(
+  makeDiscreteParam('kernel', values = kernels),
+  makeIntegerParam('degree', lower = 1, upper = 3),
+  makeNumericParam('cost', lower = 0.1, upper = 10),
+  makeNumericParam('gamma', lower = 0.1, upper = 10)
+)
+```
+
+* The *kernel* hyperparameter takes discrete values (the name of the kernel function), so we use the `makeDiscreteParam()` function to define its values as the vector of kernels we created.
+* The *degree* hyperparameter takes integer values (whole numbers), so we use the `makeIntegerParam()` function & define the lower & upper values we wish to tune over.
+* The *cost* & *gamma* hyperparameters take numeric values (any number between zero & infinity), so we use the `makeNumericParam()` function to define the lower & upper values we wish to tune over.
+
+For each of the functions, the first argument is the name of the hyperparameter given by `getParamSet('classif.svm')`.
+
+Recall when we tuned *k* for the kNN algorithm. We used the grid search procedure during tuning to try every value of *k* we defined. This is what grid search does; it tries every combination of the hyperparameter space you define & finds the best-performing combination.
+
+Grid search is great because, provided that you specify a sensible hyperparameter space to search over, it will always find the best-performing hyperparameters. However, for the hyperparameters we defined in our SVM, it may not be the best choice. Let's say we wanted to try values for the *cost* & *gamma* hyperparameters from 0.1 to 10, in steps of 0.1 (that's 100 values each). We're trying three kernel functions & three values of the *degree* hyperparameter. To perform a grid search over this parameter space will require training a model 90,000 times. In such a situation if we have the time, patience, & computational budget for a grid search, then great! But if not, instead, we can employ a technique called *random search*.
+
+Rather than trying every possible combination of parameters, random search proceeds as follows:
+
+1. Randomly select a combination of hyperparameter values.
+2. Use cross-validation to train & evaluate a model using those hyperparameter values.
+3. Record the performance metric of the model (usually, this is the mean misclassification error for classification tasks).
+4. Repeat (iterate) steps 1 to 3 as many times as your computational budget allows.
+5. Select the combination of hyperparameter values that gave you the best performing model.
+
+Unlike grid search, random search isn't guaranteed to find the best set of hyperparameter values. However, with enough iterations, it can usually find a good combination that performs well. By using random search, we can run 500 combinations of hyperparameter values, instead of all 90,000 combinations.
+
+Let's define our random search using the `makeTuneControlRandom()` function. We use the `maxit` argument to tell the function how many iterations of the random search procedure we want to use (We'll stick with 20 iterations). Next, we describe our cross-validation procedure. Recall, the k-fold cross-validation is preferred, unless the process is computationally expensive. Well, since SVM is computationally expensive, we'll compromise by using holdout cross-validation instead.
+
+```{r}
+randSearch <- makeTuneControlRandom(maxit = 20)
+cvForTuning <- makeResampleDesc('Holdout', split = 2/3)
+```
+
+We can speed up the process. R as a language does not make much use of multithreading (using multiple CPUs simultaneously to accomplish a task). However, one of the benefits of the mlr package is that it allows for multithreading to be used with its functions. This helps us use multiple cores/CPUs on our computer to accomplish tasks, such as hyperparameter tuning & cross-validation, much more quickly. (This computer, Macbook Pro 2017, has 8 cores.)
+
+To run an mlr process in parallel, we place its code between the `parallelStartSocket()` & `parallelStop()` functions from the parallelMap package. To start our hyperparameter tuning process, we call the `tuneParams()` function & supply the following as arguments:
+
+* First argument= name of the learner
+* `task` = name of our task
+* `resampling` = cross-validation procedure
+* `par.set` = hyperparameter space
+* `control` = search procedure
+
+```{r, message = FALSE}
+parallelStartSocket(cpus = detectCores())
+
+tunedSvmPars <- tuneParams('classif.svm', task = spamTask, resampling = cvForTuning,
+                           par.set = svmParamSpace, control = randSearch)
+
+parallelStop()
+```
+
+We can print the best-performing hyperparameter values & the performance of the model built with them by calling `tunedSvm`, or extract the named values (so you can train a new model using them) by calling `tunedSvm$x`. 
+
+```{r}
+tunedSvmPars
+tunedSvmPars$x
+```
+
+The values will be different every time. This is the nature of the random search: it may find different winning combinations of hyperparmeter values each time it is run. To reduce this variance, we should commit to increasing the number of itertions the search makes.
+
+
+### Training the Model with Tuned Hyperparameters
+
+Now that we've tuned our hyperparameters, we'll build our model using the best-performing combination. We'll use the `setHyperPars()` function to combine a learner with a set of predefined hyperparameter values. The first argument is the learner we want to use, & the `par.vals` argument is the object containing our tuned hyperparameter values. We then train a model using our `tunedSvm` learner with the `train()` function.
+
+```{r}
+tunedSvm <- setHyperPars(makeLearner('classif.svm'),
+                         par.vals = tunedSvmPars$x)
+tunedSvmModel <- train(tunedSvm, spamTask)
+tunedSvmModel
+```
+
+
+***
+
+
+# Cross-Validating our SVM Model
+
+We've built a model using our tuned hyperparameters. Now, we'll cross-validate the model to estimate how it will perform on new, unseen data.
+
+Recall that it's important to cross-validate *the entire model-building process*. This means any *data-dependent* steps in our model-building process (such as hyperparameter tuning) need to be included in our cross-validation. If we don't include them, our cross-validation is likely to give an overoptimistic estimate (a *biased* estimate) of how well the model will perform.
+
+Also recall that, to include hyperparameter tuning in our cross-validation, we need to use a *wrapper function* that wraps together our learner 7 hyperparameter tuning process. 
+
+Because mlr will use nested cross-validation (where hyperparameter tuning is performed in the inner loop, & the winning combination of values is passed to the outer loop), we first define our outer cross-validation strategy using the `makeResampleDesc()` for the inner loop, we'll use the `cvForTuning` resampling description.
+
+Next, we make our wrapped learner using the `makeTuneWrapper()` function. The arguments are as follows:
+
+* First argument = name of the learner
+* `resampling` = inner loop cross-validation strategy
+* `par.set` = hyperparameter space
+* `control` = search procedure
+
+Since cross-validation will take a while, it's prudent to start parallelisation with the `parallelStartSocket()` function. Now, to run our nested cross-validation, we call the `resample()` function, where the first argument is our wrapped learner, the second argument is our task, & the third argument is our outer cross-validation strategy.
+
+```{r, message = FALSE}
+outer <- makeResampleDesc("CV", iters = 3)
+svmWrapper <- makeTuneWrapper('classif.svm', resampling = cvForTuning,
+                              par.set = svmParamSpace, control = randSearch)
+parallelStartSocket(cpus = detectCores())
+cvWithTuning <- resample(svmWrapper, spamTask, resampling = outer)
+parallelStop()
+```
+
+Now, let's take a look at the result of our cross-validation procedure by printing the contents of the `cvWithTuning` object.
+
+```{r}
+cvWithTuning
+```
+
+We're correctly classifying about 90% of emails as spam or not spam. Not bad.
+
+
+***
+
+
+# Strengths & Weaknesses of the SVM Algorithm
+
+The strengths of the SVM algorithm are the following:
+
+* It's very good at learning complex nonlinear decision boundaries.
+* It performs very well on a wide variety of tasks.
+* It makes no assumptions about the distribution of the predictor variables.
+
+The weaknesses of the SVM algorithm are the following:
+
+* It is one of the most computationally expensive algorithms to train.
+* It has multiple hyperparameters that need to be tuned simultaneously.
+* It can only handle continuous predictor variables (although recoding a categorical variable as numeric *may* help in some cases).
+
+
+***
+
+
+# Summary
+
+* The naive Bayes & support vector machine (SVM) algorithms are supervised learners for classification problems.
+* Naive Bayes uses Baye's rule to estimate the probability of new data belonging to each of the possible output classes.
+* The SVM algorithm finds a hyperplane (a surface with one less dimension than there are predictors) that best separates the class.
+* While naive Bayes can handle both continuous & categorical predictor variables, the SVM algorithm can only handle continuous predictors.
+* Naive Bayes is computationally cheap, while the SVM algorithm is one of the most expensive algorithms.
+* The SVM algorithm can use kernel functions to add an extra dimension to the data that helps find a linear decision boundary.
+* The SVM algorithm is sensitive to the values of its hyperparameters, which must be tuned to maximise performance.
+* The mlr package allows parallelisation of intensive processes, such as hyperparpameter tuning, by using the parallelMap package.
