@@ -1,0 +1,231 @@
+---
+title: "Building Your First Agglomerative Hierarchical Clustering Model"
+author: "Jie Heng Yu"
+date: "7/5/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(GGally)
+library(fpc)
+```
+
+
+# Building Your First Agglomerative Hierarchical Clustering Model
+
+Sadly, there isn't an implementation of hierarchical clustering wrapped by the mlr package, so we're going to use the `hclust()` function from the buil-in stats package. 
+
+The `hclust()` function that we'll use to perform agglomerative hierarchical clustering expects a *distance matrix* as input, rather than the raw data. A distance matrix contains the pairwise distances between each combination of elements. This distance can be any distance metric we specify, & in this situation, we'll use the Euclidean distance. Because computing the distances between cases is the first step of hierarchical clustering, we might expect `hclust()` to do this for us. But this two-step process of creating our own distance metric & then supplying it to `hclust()` does allow us the flexibility of using a variety of distance metrics.
+
+We create a distance matrix in R using the `dist()` function, supplying the data we want to compute distances for as the first argument & the type of distance we want to use. Notice that we're using our scaled data set, because hierarchical clustering is also sensitive to differences in scale between variables (as in any algorithm that relies on distance between continuous variables).
+
+```{r}
+data(GvHD, package = 'mclust')
+gvhdTib <- as_tibble(GvHD.control)
+gvhdScaled <- gvhdTib %>% scale()
+gvhdDist <- dist(gvhdScaled, method = 'euclidean')
+```
+
+Now that we have our distance matrix, we can run the algorithm to learn the hierarchy in our data. The first argument to the `hclust()` function is the distance matrix, & the `method` argument allows us to specify the linkage method we wish to use to define the distance between clusters. The options available are `'ward.D'`, `'ward.D2'`, `'single'`, `'complete'`, `'average'`, `'centroid'`, & a few less commonly used ones. Notice that there are two options for Ward's method. For this example, we'll be using `'ward.D2'`.
+
+```{r}
+gvhdHclust <- hclust(gvhdDist, method = 'ward.D2')
+```
+
+Now that `hclust()` has learned the hierarchical clustering structure of the data, let's represent this as a dendrogram. We can do this by simply calling `plot()` on our clustering model object, but the tree is a little clearer if we first convert our model into a dendrogram object & plot that. We can convert our clustering model into a dendrogram object using the `as.dendrogram()` function. To plot the dendrogram, we pass it to the `plot()` function. By default, the plot will draw a label for each case in the original data. Because we have a large data set, let's suppress these labels using the argument `leaflab = 'none'`.
+
+```{r}
+gvhdDend <- as.dendrogram(gvhdHclust)
+plot(gvhdDend, leaflab = 'none')
+```
+
+The resulting plot is shown above. The y-axis here represents distance between clusters, based on whatever linkage method (& distance metric) we used. Because we used Ward's method, the values of this axis are the within-cluster sum of squares. When two clusters are merged together, they are connected by a horizontal line, the position of which along the y-axis corresponds to the distance between those clusters. Therefore, clusters of cases that merge lower down the tree (which is earlier in agglomerative clustering) are more similar to each other than clusters that merge further up the tree. The ordering of cases along the x-axis is optimised such that similar cases are drawn near each other to aid interpretation (otherwise, the branches would cross). As we can see, the dendrogram recursively joins clusters, from each case being in its own cluster to all the cases belonging to a supercluster. The hierarchical clustering algorithm has done its job: it's learned the hierarchy & what we do with it is up to us. We may want to directly interpret the structure of the tree to make some inference about a hierarchy that might exist in nature, though in our (large) data set, that could be challenging. 
+
+Another common use of hierarchical clustering is to order the rows & columns of heatmaps, for example, for gene expression data. Ordering the rows & columns of a heatmap using hierarchical clustering helps researchers identify clusters of genes & clusters of patients simultaneously. Finally, our primary motivation may be to identify a finite number of clusters within our data set that are most interesting to us. This is what we will do with our clustering result.
+
+
+### Choosing the Number of Clusters
+
+To define a finite number of clusters following hierarchical clustering, we need to define a cut point on our dendrogram. If we cut the tree near the top, we'll get fewer clusters; & if we cut the tree near the bottom, we'll get more clusters. So how do we choose a cut point? The Davies-Bouldin index & pseudo F statistic could help us. For k-means clustering , we perform a cross-validation-like procedure for estimating the performance of different numbers of clusters. Sadly, we can't use this approach for hierarchical clustering because, unlike k-means, hierarchical clustering cannot predict cluster membership of new cases.
+
+Instead, we can make use of bootstrapping. Bootstrapping is the process  of taking bootstrap samples, applying some computation to each sample, & returning a statistic(s). The mean of our bootstrapped statistic(s) tells us the most likely value, & the distribution gives us an indication as to the stability of the statistic(s).
+
+In the context of hierarchical clustering, we can use bootstrapping to generate multiple samples from our data & generate a separate hierarchy for each sample. We can then select a range of cluster numbers from each hierarchy & calculate the internal cluster metrics for each. The advantange of using bootstrapping is that calculating the internal cluster metrics on the full data set doesn't give us an indication of the stability of the estimate, whereas the bootstrap sample does. The bootstrap sample of cluster metrics will have some variation about its mean, so we can choose the number of clsuters with the most optimal & stable metrics.
+
+We'll start by defining our own function that takes our data & a vector of cluster membership & returns our two familiar internal cluster metrics for the data: the Davies-Bouldin index & the pseudo F statistic. We'll use the `function()` function to define a function, assigning it to the name `cluster_metrics`. We define three mandatory arguments for the function:
+
+* `data`, to which we will pass the data we're clustering
+* `clusters`, a vector containing the cluster membership of every case in `data`
+* `dist_matrix`, to which we will pass the precomputed distance matrix for `data`
+
+The *body* of the function is defined inside curly brackets ({}). Our function will return a list with three elements: the Davies-Bouldin index (`db`), the pseudo F statistic (`G1`), & the number of clusters. Rather than define them from scratch, we're using predefined functions from other packages to compute the internal cluster metrics. The Davies-Bouldin index is computed using the `index.DB()` function from the clusterSim package, which takes the `data` & `clusters` aurgments (the statistic itself is contained in the `$DB` component). The pseudo F statistic is computed using the `index.G1()` function, also from the clusterSim package, & takes the same arguments as `index.DB()`.
+
+```{r}
+cluster_metrics <- function(data, clusters, dist_matrix) {
+  list(db = clusterSim::index.DB(data, clusters)$DB,
+       G1 = clusterSim::index.G1(data, clusters),
+       clusters = length(unique(clusters)))
+}
+```
+
+Our motivation for defining this function is that we're going to take bootstrap samples from our data set, learn the hierarchy in each, select a range of cluster numbers from each, & use our function to calculate these two metrics for each number of clusters within each bootstrap sample. So now, let's create our bootstrap sample. We'll create 10 bootstrap samples from our gvhdScaled data set. We're using the `map()` function to repeat the sampling process 10 times, to return a list where each element is a different bootstrap sample.
+
+```{r}
+gvhdBoot <- map(1:10, ~ {
+  gvhdScaled %>%
+    as_tibble() %>%
+    sample_n(size = nrow(.), replace = TRUE)
+})
+```
+
+We're using the `sample_n()` function from the dplyr package to create the samples. This function randomly samples rows from a data set. Because this function cannot handle matrices, we first need to pipe our gvhdScaled data into the `as_tibble()` function. By setting the argument `size = nrow(.)`, we're asking `sampling_n()` to randomly draw a number of cases equal to the number of rows in the original data set. By setting the `replace` argument equal to `TRUE`, we're telling the function to sample with replacement. Creating simple bootstrap samples is simple.
+
+Now let's look at our `cluster_metrics()` function to calculate those three internal metrics for a range of cluster numbers, for each bootstrap sample we just generated. We start by calling the `map_df()` function so that we can apply a function to every element of our list of bootstrap samples. We define an anonymous function that takes `boot` (the current element being considered) as its only argument.
+
+For each element in gvhdBoot, the anonymous function computes it Euclidean distance matrix, stores it as the object `d`, & performs hierarchical clustering using that matrix & Ward's method. Once we have the hierarchy for each bootstrap sample, we use another `map_df()` function call to select between three & eight clusters to partition the data into, & then calculate the three internal clustering methods on each result. We're going to use this process to see which number of clusters, between three & eight, gives us the best internal cluster metrics values.
+
+Selecting the number of clusters to retain from a hierarchical clustering model is done using the `cutree()` function. We use this function to cut our dendrogram at a place that returns a number of clusters. We can do this either by specifying a height at which to cut, using the `h` argument, or by specifying a specific number of clusters to retain, using the `k` argument. The first argument is the result of calling the `hclust()` function. The output of `cutree()` function is a vector indicating the cluster number assigned to each case in the data set. Once we have this vector, we can call our `cluster_metrics()` function, supplying the bootstrap data, the vector of cluster membership, & the distance matrix.
+
+```{r}
+metricsTib <- map_df(gvhdBoot, function(boot) {
+  d <- dist(boot, method = 'euclidean')
+  cl = hclust(d, method = 'ward.D2')
+  
+  map_df(3:8, function(k) {
+    cut <- cutree(cl, k = k)
+    cluster_metrics(boot, clusters = cut, dist_matrix = d)
+  })
+}) 
+
+metricsTib
+```
+
+Let's plot the result of our bootstrapping experiment. We're going to create a separate subplot for each internal cluster metric (using faceting). Each subplot will show the number of clusters on the x-axis, the value of the internal cluster metric on the y-axis, a separate line for each individual bootstrap sample, & a line that connects the mean value across all bootstraps.
+
+```{r}
+metricsTib <- metricsTib %>%
+  mutate(bootstrap = factor(rep(1:10, each = 6))) %>%
+  gather(key = 'Metric', value = 'Value', -clusters, -bootstrap)
+metricsTib
+```
+
+We first need to mutate a new column, indicating the bootstrap sample each case belongs to. Because there are 10 bootstrap samples, evaluated for 6 different numbers of clusters each (3 to 8), we create this variable by using the `rep()` function to repeat each number from 1 to 10, six times. We wrap this inside the `factor()` function to ensure it isn't treated as a continuous variable when plotting. Next, we gather the data sot hat the choice of internal metric is contained within a single column & the value of that metric is held in another column. We specify `-clusters` & `-bootstrap` to tell the function not to gather those variables. 
+
+Now that our data is in format we can create the plot. We map the number of clusters (as a factor) to the x aesthetic & the value of the internal cluster metric to the y aesthetic. We add a `facet_wrap()` layer to facet by internal cluster metric, setting the `scales = 'free_y'` argument because the metrics are on different scales. Next, we add a `geom_line()` layer, using the `size` argument to make these lines less prominent, & map the bootstrap sample number to the group aesthetic. This layer will therefore draw a separate thin line for each bootstrap sample.
+
+We then add another `geom_line()` layer that will connect the mean across all bootstrap samples. By default, the `geom_line()` function likes to connect individual values. If we want the function to connect a summary statistic (like a mean), we need to specify the `stat = 'summary'` argument & then use the `fun.y` argument to tell the function what summary statistic we want to plot. Here we've used `'mean'`, but you can supply the name of any function that returns a single value of `y` for its input.
+
+Finally, it's nice to visualise the 95% confidence interval for the bootstrap sample. The 95% confidence interval tells us that, if we were to repeat this experiment 100 times, 95 of the constructed confidence intervals would be expected to contain the true value of the metric. The more the estimates agree with each other between bootstrap samples, the smaller the confidence interval will be. We want to visualise the confidence intervals using the flexible `stat_summary()` function. This function can be used to visualise multiple summary statistics in many different ways. To draw the mean +/- 95% confidence intervals, we use the `fun.data` argument to specify that we want `'mean_cl_boot'`. This will draw bootstrap confidence intervals (95% by default).
+
+Now that we've defined our summary statistics, let's specify the geom that we're going to use to represent them, using the `geom` argument. The geom `'crossbar'` draws what looks like the box part of a box & whiskers plot, where a solid line is drawn through the measure of central tendency that we specified (the mean, in this case) & the upper & lower limits of the box extend to the range of the measure of dispersion we asked for (95% confidence limits, in this case). Then according to our preference, we set the width of the crossbars to 0.5 & the fill colour to white.
+
+```{r, warning = FALSE, message = FALSE}
+ggplot(metricsTib, aes(as.factor(clusters), Value)) +
+  facet_wrap(~ Metric, scales = 'free_y') +
+  geom_line(linewidth = 0.1, aes(group = bootstrap)) +
+  geom_line(stat = 'summary', fun.y = 'mean', aes(group = 1)) +
+  stat_summary(fun.data = 'mean_cl_boot',
+               geom = 'crossbar', width = 0.5, fill = 'white') +
+  theme_bw()
+```
+
+The resulting plot is shown above. It seems that the number of clusters resulting in the smallest mean Davies-Bouldin index & the largest mean pseudo F statistic. Take a look at each line representing each individual bootstrap. Some may have led us to conclude that a different number of clusters was optimal. This is why bootstrapping these metrics is better than calculating each metric only once using a single data set.
+
+
+### Cutting the Tree to Select a Flat Set of Clusters
+
+Our bootstraping experiment has led us to conclude that 4 is the optimal number of clusters with which to represent the structure in our GvHD data set. To extract a vector of cluster memberships representing these four clusters, we use the `cutree()` function, supplying our clustering model & *k* (the number of clusters we want to return). We can visualise how our dendrogram is cut to generate these four clusters by plotting the dendrogram as before & calling the `rect.hclust()` function with the same arguments we gave to `cutree()`. The function draws rectangles on an existing dendrogram plot to show which branches are cut to result in the number of clusters we specified.
+
+```{r}
+gvhdCut <- cutree(gvhdHclust, k = 4)
+plot(gvhdDend, leaflab = 'none')
+rect.hclust(gvhdHclust, k = 4)
+```
+
+Now, we'll plot the clusters using `ggpairs()` like we did for our k-means model.
+
+```{r}
+gvhdTib <- mutate(gvhdTib, hclustCluster = as.factor(gvhdCut))
+
+ggpairs(gvhdTib, aes(col = hclustCluster),
+        upper = list(continuous = 'density'),
+        lower = list(continuous = wrap('points', size = 0.5))) +
+  theme_bw()
+```
+
+
+***
+
+
+# How Stable Are Our Clusters?
+
+In addition to calculating internal cluster metrics on each bootstrap sample in a bootstrapping experiment, we can also quantify how well the cluster memberships agree with each other between bootstrap samples. This agreement is called the cluster *stability*. A common way to quantify cluster stability is with a similarity metric called the *Jaccard index*.
+
+The Jaccard index quantifies the similarity between two sets of discrete varaibles. Its valuecan be interpreted as the percentage of the total values that are present in both sets, & it ranges from 0% (no common values) to 100% (all values common to both sets). The Jaccard index is defined:
+
+$$Jaccard~index = (\frac{number~of~values~in both~sets}{total~number~of~unique~values}) * 100$$
+
+For example, if we had two sets
+
+$$a = \{3, 3, 5, 2, 8\}$$
+
+$$b = \{1, 3, 5, 6\}$$
+
+then the Jaccard index is 
+
+$$Jaccard~index = (\frac{2}{6}) * 100 = 33.3%$$
+
+If we cluster on multiple bootstrap samples, we can calculate the Jaccard index between the 'original' clusters (the clusters on all the data) & each of the bootstrap samples, & takes the mean. If the mean Jaccard index is low, then cluster membership is changing considerably between bootstrap samples, indicating our clustering result is *unstable* & may not generalise well. If the mean Jaccard index is high, then cluster membership is changing very little, indicating a stable clustering result.
+
+Luckily for us, the `clusterboot()` function from the fpc package has been written to do just this. Because `clusterboot()` produces a series of base R plots as a side effect, we'll split the plotting device into three rows & four columns to accommodate the output, using `par(mfrow = c(3, 4))`.
+
+```{r, message = FALSE}
+par(mfrow = c(3, 4))
+
+clustBoot <- clusterboot(gvhdDist, B = 10,
+                         clustermethod = disthclustCBI,
+                         k = 4, cut = 'number', method = 'ward.D2',
+                         showplots = TRUE)
+clustBoot
+```
+
+The first argument of the `clusterboot()` function is the data. This argument will accept either a raw data or a distance matrix of class `dist` (it will handle either appropriately). The argument `B` is the number of bootstrap samples we wish to calculate, which we've set to 10 for the sake of reducing running time. The `clustermethod` argument is where we specify which type of clustering model we wish to build. For hierarchical clustering, we set this argument equal to `disthclustCBI`. The `k` argument specifies the number of clusters we want to return, `method` lets us specify the distance metric to use for clustering, & `showplots` gives us the opportunity to suppress the printing of plots if we wish. 
+
+The most important information from the result of the `clusterboot()` is the cluster-wise Jaccard bootstrap means. These four values are the mean Jaccard indices for each cluster, between the original clusters & each bootstrap sample. We can see that all four clusters have good agreement (> 83%) across different bootstrap samples, suggesting high stability of the clusters.
+
+The resulting plot is above. The first (top-left) & last (bottom-right) plots show the clustering in the original, full data set. Each plot between these shows the clustering on a different bootstrap sample. This plot is a useful way of graphically evaluating the stability of the clusters.
+
+
+***
+
+
+# Strengths & Weaknesses of Hierarchical Clustering
+
+The strengths of hierarchical clustering are as follows:
+
+* It learns a hierarchy that may in & of itself be interesting & interpretable.
+* It is quite simple to implement.
+
+The weaknesses of hierarchical clustering are these:
+
+* It cannot natively handle categorical variables. This is because calculating the Euclidean distance on a categorical feature space isn't meaningful.
+* It cannot select the optimal number of 'flat' clusters
+* It is sensitive to data on different scales.
+* It cannot predict cluster membership of new data. 
+* Once cases have been assigned to a cluster, they cannot be moved.
+* It can become computationally expensive with large data sets.
+* It is sensitive to outliers.
+
+
+***
+
+
+# Summary
+
+* Hierarchical clusters use the distances between cases to learn the hierarchy of clusters.
+* How these distances are calculated is controlled by our choice of linkage method.
+* Hierarchical clustering can be bottom-up (agglomerative) or top-down (divisive).
+* A flat set of clusters can be returned from a hierarchical clustering model by 'cutting' the dendrogram at a particular height.
+* Cluster stability can be measured by clustering on bootstrap samples & using the Jaccard index to quantify the agreement of cluster membership between samples.

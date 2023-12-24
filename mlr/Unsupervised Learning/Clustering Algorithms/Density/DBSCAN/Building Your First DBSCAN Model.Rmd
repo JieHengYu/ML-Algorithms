@@ -1,0 +1,139 @@
+---
+title: "Building Your First DBSCAN Model"
+author: "Jie Heng Yu"
+date: "7/12/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(mclust)
+library(GGally)
+library(dbscan)
+library(purrr)
+```
+
+
+# Building Your First DBSCAN Model
+
+For this lesson, we'll show how to use the DBSCAN algorithm to cluster a data set. We'll then validate its performance & select the best-performing hyperparameter combination.
+
+
+### Loading & Exploring the Banknote Data Set
+
+We're going to work with the Swiss bank not data set to which we applied PCA, t-SNE, & UMAP before. Once we've loaded the data set, we convert it into a tibble & create a separate tibble after scaling the data (because DBSCAN & OPTICS) are sensitive to variables scales). Because we're going to imagine we have no ground truth, we remove the `Status` variable, indicating which banknotes are genuine & which are counterfeit. The tibble contains 200 Swiss banknotes, with 6 measurements of their dimensions.
+
+```{r}
+data(banknote, package = 'mclust')
+
+swissTib <- select(banknote, -Status) %>% as_tibble()
+swissTib
+swissScaled <- swissTib %>% scale()
+```
+
+We'll plot the data using `ggpairs to remind ourselves of the structure of the data.
+
+```{r}
+ggpairs(swissTib, upper = list(continuous = 'density')) +
+  theme_bw()
+```
+
+
+### Tuning Epsilon & minPts Hyperparameters
+
+Now we'll show how to select sensible ranges of *epsilon* & *minPts* for DBSCAN, & how we tune them manually to find the best-performing combination. Choosing the value of the *epsilon* hyperparameter is, perhaps, not obvious. How far away from each case should we search? Luckily, there is a heuristic method we can use to at least get in the right ballpark. This consists of calculating the distance from each point to its *k*th-nearest neighbour & then ordering the points in a plot based on this distance. In data with regions of high & low density, this tends to produce a plot containing a 'knee' or 'elbow'. The optimal value of *epsilon* is in or near that knee/elbow. Because a core point in DBSCAN has *minPts* cases inside its *epsilon*, choosing a value of *epsilon* at the kneww of this plot means choosing a search distance that will result in cases in high-density regions being considered core point. We can create this plot using the `kNNdistplot()` function from the dbscan package.
+
+We need to use the *k* argument to specify the number of nearest neighbours we want to calculate the distance to. but we don't yet know what our *minPts* argument should be, so how can we set k? Usually, we pick a sensible value we believe is approximately correct (recall that *minPts* defines the minimum cluster size); we'll pick 5. The position of the knee in the plot is relatively robust to changes in k.
+
+The `kNNdistplot()` function will create a matrix with as many rows as there are cases in the data set (200) & 5 columns, one for the distance between each case & each of its 5 nearest neighbours. Each of these 200 x 5 = 1,000 distance will be drawn on the plot. 
+
+We then use the `abline()` function to draw horizaontal lines at the start & end of the knee, to help us identify the range of *epsilon* values we're going to tune over. The resulting plot is below. Notice that, reading the plot from left to right, after an initial sharp increase, the 5-nearest-neighbour distance increases only gradually, until it rapidly increases again. This region where the curve inflects upward is the knee/elbow, & the optimal value of *epsilon* at this nearest-neighbour distance in this inflection. Using this method, we select 1.2 & 2.0 as the lower & upper limits over which we tune *epsilon*.
+
+```{r}
+kNNdistplot(swissScaled, k = 5)
+abline(h = c(1.2, 2.0))
+```
+
+We'll manually define our hyperparameter search space for *epsilon* & *minPts*. We use the `expand.grid()` function to create a data frame containing every combination of the values of *epsilon* (`eps`) & `minPts` we want to search over. We're going to search across values of *epsilon* between 1.2 & 2.0, in steps of 0.1;& we'll search across values of *minPts* between 1 & 9, in steps of 1.
+
+```{r}
+dbsParamSpace <- expand.grid(eps = seq(1.2, 2.0, 0.1),
+                             minPts = seq(1, 9, 1))
+dbsParamSpace
+```
+
+Now that we've defined our hyperparameter search space, let's run the DBSCAN algorithm on each distinct combination of *epsilon* & *minPts*. To do this, we use the `pmap()` function from the purr package to apply the `dbscan()` function to each row of the `dbsParamSpace` object.
+
+```{r}
+swissDbs <- pmap(dbsParamSpace, dbscan, x = swissScaled)
+swissDbs[[5]]
+```
+
+We supply our scaled data set as the argument to `dbscan()`'s argument, `x`. The output from `pmap()` is a list where each element is the result of running DBSCAN on that particular combination of *epsilon* & *minPts*. To view the output for a particular permutation, we simply subset the list.
+
+The output, when printing the result of a `dbscan()` call, tells us the number of objects in the data, the values of *epsilon* & *minPts*, & the number of identified clusters & noise points. Perhaps the most important information is the number of cases within each cluster. In this example, we can see there are 189 cases in cluster 2, & just a single case in most of the other clusters. This is because this permutation was run with *minPts* equal to 1, which allows clusters to contain just a single case. This is rarely what we want & will result in a clustering model where no cases are identified as noise.
+
+Now that we have our clustering result, we should visually inspect the clustering to see which (if any) of the permutations give a sensible result. To do this, we want to extract the vector of cluster membership from each permutation as a column & then add these columns to our original data.
+
+The first step is to extract the cluster memberships as separate columns in a tibble. To do this, we use the `map_dfc()` function. We've encountered the `map_df()` function before: it applies a function to each element of a vector & returns the output as a tibble, where each output forms a different row of the tibble. This is actually the same as using `map_dfr()`, where the *r* means row-binding. If, instead, we want each output to form a different *column* of the tibble, we use `map_dfc()`.
+
+```{r}
+clusterResults <- map_dfc(swissDbs, ~.$cluster)
+clusterResults
+```
+
+Now that we have our tibble of cluster memberships, let's use the `bind_cols()` function to bind the columns of our `swissTib` tibble & our tibble of cluster memberships. We call this new tibble `swissClusters`, which sounds like a breakfast cereal. Notice that we have our original variables, with additional columns containing the cluster membership output from each permutation.
+
+```{r}
+swissClusters <- bind_cols(swissTib, clusterResults)
+swissClusters
+```
+
+In order to plot the results, we would like to facet by permutation so we can draw a separate subplot for each combination of our hyperparameters. To do this, we need to `gather()` the data to create a new column indicating permutation number & another column indicating the cluster number.
+
+```{r}
+swissClustersGathered <- gather(swissClusters,
+                                key = 'Permutation', value = 'Cluster', 
+                                -Length, -Left, -Right, 
+                                -Bottom, -Top, -Diagonal)
+swissClustersGathered
+```
+
+Now our tibble is in a format ready for plotting. We can see from the above printed result that the variables that most obviously separate clusters in the data are `Right` & `Diagonal`. As such, we'll plot these variables against each other by mapping them to the x & y aesthetics, respectively. We map the `Cluster` variable to the colour aesthetic (wrapping it inside `as.factor()` so the colours aren't drawn as a single gradient). We then facet by `Permutation`, add a `geom_point()` layer, & add a theme. Because some of the cluster models have a large number of clusters, we suppress the drawing of what would be a very large legend, by adding the line `theme(legend.position = 'none')`. 
+
+```{r}
+ggplot(swissClustersGathered, aes(Right, Diagonal,
+                                  col = as.factor(Cluster))) +
+  facet_wrap(~ Permutation) +
+  geom_point(size = 0.05) +
+  theme_bw() +
+  theme(legend.position = 'none')
+```
+
+The resulting plot is shown above. We can see that different combiantions of *epsilon* & *minPts* have resulted in substantially different clustering models. Many of these models capture the two obvious clusters in the data set, but most don't.
+
+How are we going to choose the best-performing combination of *epsilon* & *minPts*? Visually checking to make sure the clusters are sensible is important, but we can calculate internal cluster metrics to help guide our choice.
+
+We define our own function that takes the daata & the cluster membership from a clustering model & calculate the Davies-Bouldin index & the pseudo F statistic. 
+```{r}
+cluster_metrics <- function(data, clusters, dist_matrix) {
+  list(db = clusterSim::index.DB(data, clusters)$DB,
+       G1 = clusterSim::index.G1(data, clusters),
+       dunn = clValid::dunn(dist_matrix, clusters),
+       clusters = length(unique(clusters)))
+}
+```
+
+To help us select which of our clustering models best captures the structure in the data, we'll take bootstrap samples from our data set & run DBSCAN using all 81 combinations of *epsilon* & *minPts* on each bootstrap sample. We can then calculate the mean of each of our performance metrics & see how stable they are.
+
+We'll start by generating 10 bootstrap samples from our `swissScaled` data set. We do this by using the `sample_n()` function & setting the `replace` argument equal to `TRUE`.
+
+```{r}
+swissBoot <- map(1:10, ~ {
+  swissScaled %>%
+    as_tibble() %>%
+    sample_n(size = nrow(.), replace = TRUE)
+})
+```
