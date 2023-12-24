@@ -1,0 +1,161 @@
+---
+title: "Building Your First Linear & Quadratic Discriminant Model"
+author: "Jie Heng Yu"
+date: "1/8/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(plotly)
+```
+
+
+# Building Your First Linear/Quadratic Discriminant Model
+
+Imagine we are detectives in a murder mystery. A local wine producer, Ronald Fisher, was poisoned at a dinner party when somebody replaced the wine in the carafe with wine poisoned with arsenic. 3 other rival wine producers were at the party & are our prime suspects. If we can trace the wine to one of the 3 vineyards, we'll find our murderer. As luck would have it, we have access to some previous chemical analysis of the wines from each of the vineyards, & we order an analysis of the poisoned carafe at the scene of the crime. Our task is to build a model that will tell us which vineyard the wine with arsenic came from &, therefore, the guilty party.
+
+
+### Loading & Exploring the Data Set
+
+We'll start by exploring our data set. We have a tibble containing 178 cases & 14 variables of measurements made on various wine bottles.
+
+```{r}
+data(wine, package = 'HDclassif')
+wineTib <- as_tibble(wine)
+wineTib
+```
+
+As you can see right now, we have data that is messy & not well curated. The column names do not mean anything. We could continue working with V1, V2, etc, but it would be hard to keep track of. So instead, we will manually add the variable names. Then we'll convert the `class` variable to a factor.
+
+```{r}
+colnames(wineTib) <- c('Class', 'Alco', 'Malic', 'Ash', 'Alk', 'Mag', 'Phe', 'Flav', 'Non_flav', 'Proan', 'Col', 'Hue', 'OD', 'Prol')
+wineTib$Class <- as.factor(wineTib$Class)
+wineTib
+```
+
+We'll plot the data to get an idea of how th compounds vary between the vineyards.
+
+```{r}
+wineUntidy <- gather(wineTib, 'Variable', 'Value', -Class)
+
+ggplotly(
+  ggplot(wineUntidy, aes(Class, Value)) +
+    facet_wrap(~Variable, scales = 'free_y') +
+    geom_boxplot() +
+    theme_bw()
+)
+```
+
+Any data scientist & detective working on the case looking at this data would jump for joy at how many obvious differences there are between wines form the 3 different vineyards. We should easily be able to build a well-performing classification model because the classes are so separable.
+
+
+***
+
+
+### Training the Models
+
+Let's define our task & learner, & build the model as usual. This time, we supply `"classif.lda"` as the argument to `makeLearner()` to specify that we're going to use LDA.
+
+```{r, warning = FALSE}
+wineTask <- makeClassifTask(data = wineTib, target = 'Class')
+lda <- makeLearner('classif.lda')
+ldaModel <- train(lda, wineTask)
+```
+
+Let's extract the model information using the `getLearnerModel()` function & get DF values for each vase using the `predict()` function. By printing `head(ldaPreds)`, we can see that the model has learned two DFs, `LD1` & `LD2`, & that the `predict()` function has indeed returned the values for these functions fore ach vase in our `wineTib` data set.
+
+```{r}
+ldaModelData <- getLearnerModel(ldaModel)
+ldaPreds <- predict(ldaModelData)$x
+head(ldaPreds)
+```
+
+To visualise how the two learned DFs separate the bottle of wine from the 3 vineyards, we'll plot them against each other. We start by piping the `wineTib` dataset into a `mutate` call where we create a new column for each of the DFs. We then pip this mutated tibble into `ggplot()` & set `LD1`, `LD2`, & `Class` as the x, y, & colour aesthetics, respectively. Finally, we add a `geom_point()` layer to add dots, & a `stat_ellipse()` layer to draw 95% confidence ellipses around each class.
+
+```{r}
+ggplotly(
+  wineTib %>%
+    mutate(LD1 = ldaPreds[, 1], LD2 = ldaPreds[, 2]) %>%
+    ggplot(aes(LD1, LD2, colour = Class)) +
+    geom_point() + stat_ellipse() +
+    theme_bw()
+)
+```
+
+We can see that LDA has reduced our 13 predictor variables into just two DFs that do an excellent job of separating the wines from each of the vineyards.
+
+Now, we'll do the exact same procedure to build a QDA model.
+
+```{r}
+qda <- makeLearner('classif.qda')
+qdaModel <- train(qda, wineTask)
+```
+
+**Note: Sadly, it isn't easy to extract the DFs from the implementation of QDA that mlr uses, to plot them as we did for LDA.**
+
+Now, let's cross-validate our LDA & QDA model together to estimate how they will perform on new data.
+
+```{r, message = FALSE}
+kFold <- makeResampleDesc(method = 'RepCV', folds = 10, reps = 50, 
+                          stratify = TRUE)
+ldaCV <- resample(learner = lda, task = wineTask, resampling = kFold, 
+                  measures = list(mmce, acc))
+qdaCV <- resample(learner = qda, task = wineTask, resampling = kFold,
+                  measures = list(mmce, acc))
+ldaCV$aggr
+qdaCV$aggr
+```
+
+Our LDA model correctly classified 98.8% of wine bottles on average. There isn't much room for improvement here, but our QDA model managed to correctly flassify 99.2% of the cases. Let's also look at the confusion matrices.
+
+```{r}
+calculateConfusionMatrix(ldaCV$pred, relative = TRUE)
+calculateConfusionMatrix(qdaCV$pred, relative = TRUE)
+```
+
+Now, detective, the chemical analysis of the poisoned wine is in. Let's use our QDA model to predict which vineyard it came from.
+
+```{r, warning = FALSE}
+poisoned <- tibble(Alco = 13, Malic = 2, Ash = 2.2, Alk = 19, Mag = 100, Phe = 2.3, Flav = 2.5, Non_flav = 0.35, Proan = 1.7, Col = 4, Hue = 1.1, OD = 3, Prol = 750)
+
+predict(qdaModel, newdata = poisoned)
+```
+
+The model predicts that the poisoned bottle came from vineyard 1. Time to go & make an arrest!
+
+
+***
+
+
+# Strengths & Weakneses of LDA & QDA
+
+The strengths of LDA & QDA algorithms are as follows:
+
+* They can reduce a high-dimensional feature space into a much more manageable number.
+* They can be used for classification or as preprocessing (dimension reduction) technique for other classification algorithms that may perform better on the data set.
+* QDA can learn curved decision boundaries between classes (this isn't the case for LDA).
+
+The weaknesses of LDA & QDA algorithms are as follows:
+
+* The can only handle continuous predictors (although recoding a categorical variable as numeric *may* help in some cases).
+* They assume the data is normally distributed across the predictors. If the data is not, performance will suffer.
+* LDA can only learn linear decision boundaries between classes (this isn't the case for QDA).
+* LDA assumes equal covariances of the classes, & performance will suffer if this isn't the case (this isn't the case for QDA).
+* QDA is more flexible than LDA & can be more prone to overfitting.
+
+
+***
+
+
+# Summary
+
+* Discriminant analysis is a supervised learning algorithm that projects the data onto a lower-dimensional representation to create discriminant functions.
+* Discriminant functions are linear combinations of the original (continuous) variables that maximise the separation of class centroids while minimising the variance of each class along them.
+* Discriminant analysis comes in many flavours, the most fundamental of which are LDA & QDA.
+* LDA learns linear decision boundaries between clases & assumes that classes are normally distribubed & have equal covariances.
+* QDA can learn curved decision boundaries between classes & assumes that each class is normally distributed, but does not assume equal covariances.
+* The number of discriminant functions is the smaller of the number of classes minus 1, or the number of predictor variables.
+* Class prediction uses Baye's rule to estimate the posterior probability of a case belong to each of the classes.
