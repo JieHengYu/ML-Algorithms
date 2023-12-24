@@ -1,0 +1,167 @@
+---
+title: "Building Your First PCA Model"
+author: "Jie Heng Yu"
+date: "4/15/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(plotly)
+library(parallel)
+library(parallelMap)
+library(GGally)
+library(factoextra)
+```
+
+
+# Building Your First PCA Model
+
+Imagine that we work for the Swiss Federal Department of Finance (due to our love of money, chocolate, cheese & political neutrality). The department believes that a large number of counterfeit Swiss banknotes are in circulation, & it's your job to find a way of identifying them. Nobody has looked into this before, & there is no labeled data to go on. So we ask 200 of our colleagues to each give us a banknote & we measure the dimensions of each notes. We hope that there will be some discrepancies between genuine notes & counterfeit ones that we may be able to identify using PCA.
+
+
+### Loading & Exploring the Banknote Data Set
+
+We'll start by loading our data from the mclust package & converting the data frame into a tibble. We have a tibble containing 200 banknotes with 7 variables.
+
+```{r}
+data(banknote, package = 'mclust')
+swissTib <- as_tibble(banknote)
+swissTib
+```
+
+Notice that this tibble is, in fact, labeled. We have the variables `Status` telling us whether each note is genuine or counterfeit. This is purely fro teaching purposes; we're going to exclude it from the PCA analysis but map the labels onto the final principal components later, to see whether the PCA model separates the classes.
+
+In situations where I have a clear outcome variable, we often plot each of our predictor variables against the outcome. In unsupervised learning situations, we don't have an outcome variable, so we prefer to plot all the variables against each other (provided we don't have so many variables as to prohibit doing so). We can do this easily using the `ggpairs()` function from the GGally package. We pass our tibble as the first argument to the `ggpairs()` function, & then we supply any additional aesthetic mappings by passing ggplot's `aes()` function to the mapping argument. Finally, we add a `theme_bw()` layer to add the black-&-white theme.
+
+```{r}
+ggpairs(swissTib, aes(col = Status)) +
+  theme_bw()
+```
+
+The output from `ggpairs()` draws a different kind of plot for each combination of variables types. For example, along the top row of facets are box plots showing the distribution of each continuous variables against the categorical variable.We get the same thing in the histogram from down the left column of facets. The diagonal facets show the distributions of values for each variable, ignoring all others. Finally, dot plots shown the bivariate relationships between pairs of continuous variables.
+
+Looking at the plots, we can see that some of the variables seem to differentiate between the genuine & counterfeit banknotes, such as the `Diagonal` variables. The `Length` variable, however, contains little information that discriminates the two classes of banknotes.
+
+
+### Performing PCA
+
+We start by using the `select()` function to remove the `Status` variable, & pipe the resulting data into the `prcomp()` function. There are two additional important arguments to the `prcomp()` function: `center` & `scale`. The `center` argument controls whether the data is mean-centered before applying PCA, & its default value is `TRUE`. We should always center the data before applying PCA because this removes the intercept & forces the principal axes to pass through the origin.
+
+```{r}
+pca <- select(swissTib, -Status) %>%
+  prcomp(center = TRUE, scale = TRUE)
+pca
+```
+
+The `scale` argument controls whether the variables are divided by their standard deviations to put them all on the same scale as each other, & its default value is `FALSE`. There isn't a clear consensus on whether we should standardise our variables before running PCA. A common rule of thumb is that if our original variables are measured on a simlar scale, standardisation isn't necessary; but if we ave one variable measuring grams & another measuring kilograms, we should standardise them by setting `scale = TRUE` to put them on the same scale. This is important because if we have one variable measured on a much larger scale, this variable will dominate the eigenvectors, & the other variables will contribute much less information to the principal components. In this example, we'll set `scale = TRUE`.
+
+When we print the `pca` object, we get a printout of some information from our model. The `Standard deviations` component is a vector of the standard deviations of the data along each of the principal components. Because the variance is the square of the standard deviation, to convert these standard deviations into the eigenvalues for the principal components, we can simply square them. Notice that the magnitude of the values get smaller from left to right? This is because the principal components explain sequentially less of the variance in the data.
+
+The `Rotation` component contains six eigenvectors. Remember that these eigenvectors describe how far along each original variable we go, so that we're one unit along the principal axis away from the origin. These eigenvectors describe the direction of the principal axes.
+
+If we pass our PCA results to the `summary()` function, we get a braeakdown of the importance of each of the principal components. The `Standard deviation` row contains the square root of the eigenvalues. The `Proprotion of Variance` row tells us how  much of the total variance is accounted for by each principal component. This is calculated by dividing each eigenvalue by the sum of eigenvalues. The `Cumulative Proportion` row tells us how much variance is accounted for by the principal components so far. For ecample, we can see that PC1 & PC2 account for 49.1% & 21.3% of the total variance, respoectively; cumulatively, they both account for 70.4%. This information is useful when we're deciding how many principal components to retain for our downstream analysis.
+
+If we're interested in interpreting our principal components, it's useful to extract the *variable loadings*. The variable loadings tell us how much each of the original variables correlates with each of the principal components. The formula for calculating the variable loadings for a particular principal component is
+
+$$variable loadings = eigenvector * \sqrt{eigenvalue}$$
+
+We can calculate all of the variable loadings simultaneously for all principal components & return them as a tibble using the `map_dfc()` function.
+
+```{r}
+map_dfc(1:6, ~pca$rotation[, .] * sqrt(pca$sdev ^ 2)[.])
+```
+
+We can interpret these values are Pearson correlation coefficients, so we can see that the `Length` variable has very little correlation with PC1 (0.012), but a very strong negative correlation with PC2 (-0.922). This helps us conclude that, on average, cases with a small component score for PC2 have a larger `Length`.
+
+
+### Plotting the Result of our PCA
+
+Next, we'll plot the results of our PCA model to better understand the relationships in the data by seeing if the model has revealed any patterns. There are some nice plotting functions for PCA results in the factoextra package. From there, we can use the `get_pca()` function to grab the information from our PCA model so we can apply factoextra functions to it.
+
+The `fviz_pca_biplot()` function draws a *biplot*. A biplot is a common method of simultaneously plotting the component scores, & the variable loadings for the first two principal components. We'll see the biplot below. The dots show the component scores for each of the banknotes against the first two principal components, & the arrows indicate the variable loadings of each variable. This plot helps us identify that we seem to have two distinct clusters of banknotes, & the arrows help us to see which variables tend to correlate with each of the clusters. For example, the rightmost cluster in this plot tends to have higher values for the `Diagonal` variable.
+
+```{r}
+pcaDat <- get_pca(pca)
+fviz_pca_biplot(pca, label = 'var')
+```
+
+The `fciz_pca_var()` function draws a *variable loading plot*. We can see the variable loading plot below. Notice that this shows the same variable loading arrows as in the biplot, but now the axes represent the correlation of each of the variables with each principal component. This plot shows how much each original variable correlates with the first two principal components.
+
+```{r}
+fviz_pca_var(pca)
+```
+
+The `fviz_screeplot()` function draws a *scree plot*. A scree plot is a common way of plotting the principal components against the amount of variance they explain in the data, as a graphical way to help identify how many principal components to retain. The function allows us to plot either the eigenvalue or the percentage variance accounted for by each principal component, using the `choice` argument. 
+
+```{r}
+fviz_screeplot(pca, addlabels = TRUE, choice = 'eigenvalue')
+fviz_screeplot(pca, addlabels = TRUE, choice = 'variance')
+```
+
+When deciding how many principal components to retain, there are a few rules of thumb. One is to keep the principal components that cumulatively explain at least 80% of the variance. Another is to retain all principal components with eigenvalues of at least 1; the mean of all eigenvalues is always 1. so this results in retaining principal components that contain more information than the average. A third rule of thumb is to look for an 'elbow' in the scree plot & exclude principal components beyond the elbow (although there is no obvious elbow in our example). Instead of relying too much on these rules of thumb, we look at our data projected onto the principal components, & consider how much information we can tolerate losing for our application. If we're applying PCA to our data before applying a machine learning algorithm to it, it would be better to use automated feature-selection methods to select a combination of principal components that results in the best performance.
+
+Finally, let's plot our first two principal components together against each other & see how well they're able to separate the genuine & counterfeit banknotes. We first mutate the original data set to include a column of component scores for PC1 & PC2 (extracted from our `pca` object using `$x`). We then plot the principal components against each other & add a colour aesthetic for the `Status` variable.
+
+```{r}
+swissPCA <- swissTib %>%
+  mutate(PCA1 = pca$x[, 1], PCA2 = pca$x[, 2])
+
+ggplotly(
+  ggplot(swissPCA, aes(PCA1, PCA2, col = Status)) +
+    geom_point() + theme_bw()
+)
+```
+
+We started with 6 continuous variables & condensed most of that information into just two principal components that contain enough information to separate the two clusters of banknotes. IF we didn't have labels, having identified different clusters of data, we would now try to understand what those two clusters were, & perhaps come up with a way of discriminating genuine banknotes from counterfeits.
+
+
+### Computing the Component Scores of New Data
+
+We have our PCA model, but what do we do when we get new data. Because the eigenvectors describe exactly how much each variable contributes to the value of each principal component, we can simply calculate the component scores of new data (including centering & scaling, if we performed this as part of the model).
+
+Let's generate some new data to see how this works in practice. We first define a tibble consisting of two new cases, & all the same variables entered into our PCA model. To calculate the component scores of these new cases, we simply use the `predict()` function, passing the model as the first argument & the new data as the second argument. As we can see, the `predict()` function returns both cases' component scores for each of the principal components.
+
+```{r}
+newBanknotes <- tibble(
+  Length = c(214, 216),
+  Left = c(130, 128),
+  Right = c(132, 129),
+  Bottom = c(12, 7),
+  Top = c(12, 8),
+  Diagonal = c(138, 142)
+)
+
+predict(pca, newBanknotes)
+```
+
+
+***
+
+
+# Strengths & Weaknesses of PCA
+
+The strengths of PCA are as follows:
+
+* PCA creates new axes that are directly interpretable in terms of the original variables.
+* New data can be projected onto the principal axes.
+* PCA is really a mathematical transformation & so is computationally inexpensive.
+
+The weaknesses of PCA are as follows:
+ 
+* Mapping from high dimensions to low dimensions cannot be nonlinear.
+* It cannot handle categorical variables natively.
+* The final number of principal componenets to retain must be decided by use for the application at hand.
+
+
+***
+
+
+# Summary
+
+* Dimension reduction is a class of unsupervised learning that learns a low-dimensional representation of a high-dimensional data set while retaining as much information as possible.
+* PCA is a linear dimension-reduction technique that finds new axes that maximise the variance in the data. The first of these principal axes maximises the most variance, followed by the second, & the thrid, & so on, which are all orthogonal to the previously computed axes.
+* When data is projected onto these principal axes, the new variables are called principal componenets.
+* In PCA, eigenvalues represent the variance along a principal component, & the eigenvector represents the direction of the principal axis through the original feature space.

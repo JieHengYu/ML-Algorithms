@@ -1,0 +1,186 @@
+---
+title: "Building Your First SOM Model"
+author: "Jie Heng Yu"
+date: "6/7/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(GGally)
+library(mlr)
+library(kohonen)
+```
+
+
+# Building Your First SOM
+
+Imagine that we're the ringleaders of a flea circus. We decide to take measurements for all of our fleas to see if different groups of fleas perform better at certain circus tasks. 
+
+
+### Loading & Exploring the `flea` Dataset
+
+```{r}
+data(flea)
+fleaTib <- as_tibble(flea)
+fleaTib
+```
+
+We load the data, convert it into a tibble with `as_tibble()`, & plot it using the `ggpairs()` function.
+
+```{r}
+ggpairs(flea, aes(col = species)) +
+  theme_bw()
+```
+
+We have a tibble containing 7 variables, measured on 74 different fleas. The `species` variable is a factor telling us the species each flea belongs to, while the others are continuous measurements made on various parts of the fleas' bodies. We're going to omit the `species` variable from our dimension reduction, but we'll use it later to see whether our SOM clusters together fleas from the same species.
+
+We can see that three species of fleas can be discriminated between using different combinations of variables. Let's train a SOM to reduce these six continuous variables into a representation with only two dimensions, & wee how well it separates the three species of fleas.
+
+
+### Training the SOM
+
+Let's train our SOM to place fleas in nodes such that fleas of the same species are placed near each other & fleas of different species are separated. The first thing we need to do is to create a grid of nodes that will become our map. We do this by using the `somgrid()` function & we have a few choices to make:
+
+* The dimensions of the map
+* Whether our map will be made of rectangular or hexagonal nodes
+* Which neighbourhood function to use
+* How the edges of the map will behave.
+
+We'll have the `somgrid()` function make those choices, but we'll explore what they each mean & how they affect the resulting map.
+
+```{r}
+somGrid <- somgrid(xdim = 5, ydim = 5, topo = 'hexagonal',
+                   neighbourhood.fct = 'bubble', toroidal = FALSE)
+somGrid
+```
+
+
+**Choosing the Dimensions of the Map**
+
+First, we need to choose the number of nodes in the x & y dimensions, using `xdim` & `ydim` arguments, respectively. This is important because it determines the size of the map & the granularity with which it will partition our cases. How do we choose the dimensions of our map? Too few nodes & all of our data will be piled up so that clusters of cases merge with each other. Too many nodes & we could end up with nodes containing a single case, or even no cases at all, diluting any clusters & preventing interpretation.
+
+The optimal dimensions of a SOM depend largely on the number of cases in the data. We want to aim to have cases in most of the nodes for a start, bu really the optimal number of nodes in the SOM is whichever best reveals patterns in the data. We can also plot the *quality* of each node, which is a measure of the average difference between each cases in a particular node & that node's final weights. We can then consider choosing a map size that gives us the best-quality nodes. In this example, we started by creating a 5x5 grid, but this subjectivity in selecting the dimensions of the map is arguably a weakness of SOM.
+
+
+**Choosing Whether The Map Has Rectangular or Hexagonal Nodes**
+
+The next choice is to decide whether our grid is formed of rectangular or hexagonal nodes. Rectangular nodes are connected to four adjacent nodes, whereas hexagonal nodes are connected to six adjacent nodes. Thus when a node's weights are updated a hexagonal node will update its six immediate neighbours the most, whereas a rectangular node will update its four immediate neighbours the most. While hexagonal nodes can potentially result in 'smoother' maps in which clusters of data appear more rounded (whereas clusters of data in a grid of rectangular nodes may appear 'blocky'), it depends on the data. In this example, we specify that we want a hexagonal topology by setting the `topo = 'hexagonal` argument.
+
+
+**Choosing a Neighbourhood Function**
+
+Next, we need to choose which neighbourhood function we're going to use, supplying our choice to the `neighbourhood.fct` argument. The two options are `'bubble'` & `'gaussian'`. Our choice of neighbourhood function is a hyperparameter, & we could tune it. For this example, we're just going to use the bubble neighbourhood function, which is the default.
+
+
+**Choosing How Map Edges Behave**
+
+The final choice we need to make is whether we want our grid to be *toroidal*. If the grid is toroidal, nodes on the left edge of the map are connected to the nodes on the right edge (& equivalent for nodes on the top & bottom edges). If we were to walk off the left edge of a toroidal map, we would reappear on the right. Because nodes on the edges have fewer connections to other nodes, their weights tend to be updated less than those of nodes in the middle of the map. Therefore, it may be beneficial to use a toroidal map to help prevent cases from 'piling up' on the map edges, thought toroidal maps tend to be harder to interpret. In this example, we set the toroidal argument to `FALSE` to make the final map more interpretable.
+
+
+**Training the SOM with the som() Function**
+
+Now that we've initialised our grid, we can pass our tibble into the `som()` function to train our map.
+
+```{r}
+fleaScaled <- fleaTib %>%
+  select(-species) %>%
+  scale()
+
+fleaSom <- som(fleaScaled, grid = somGrid, rlen = 5000,
+               alpha = c(0.05, 0.01))
+```
+
+We start by piping the tibble into the `select()` function to remove the `species` factor. Cases are assigned to the node with the most similar weights, so it's important to scale our variables so variables on large sclaes aren't given more importance. To this end, we pipe our output of the `select()` function call into the `scale()` function to center & scale each variable.
+
+To build the SOM, we use the `som()` function from the kohonen package, supplying the following:
+
+* The data as the first argument
+* The grid object as the second argument
+* The two hyperparameter arguments *rlen* & *alpha*
+
+The *rlen* hyperparameter is simply the number of times the data set is presented to the algorithm for sampling ( the number of iterations); the default is 100. Just like in other algorithms we've seen, more iterations are usually better until we get diminishing returns. 
+
+The *alpha* hyperparameter is the learning rate & is a vector of two values. Remember that as the number of iterations increases, the amount by which the weights of each node is updated decreases. This is controlled by the two values of *alpha*. Iteration 1 uses the first value of *alpha*, which linearly declines to the second value of *alpha* at the last iteration.
+
+The vector `c(0.05, 0.01)` is the default, but for larger SOMs, if we're concerned the SOM is doing a poor job of separating classes with subtle differences between them, we can experiment with reducing these values to make the learning rate even slower.
+
+
+### Plotting the SOM Result
+
+Now that we've trained our SOM, we'll plot some diagnostic information about it. The kohonen package comes with plotting functions to draw SOMs, but it uses base R graphics rather than ggplot2. The syntax to plot a SOM object is `plot(x, type, shape)`, where `x` is our SOM object, `type, is the type of plot we want to draw, & `shape` let's us specify whether we want the nodes to be drawn as circles or with straight edges (squares if the grid is rectangular, hexagons if the grid is hexagonal).
+
+There are six different diagnostic plots we can draw for our SOM, but rather than writing out the `plot()` function six times, we define a vector with the names of the plot types & use the `walk()` function to plot all at once. We first split the plotting device into six regions by running `par(mfrow = c(2, 3))`.
+
+We could achieve the same result with `purr::map()`, but `purr::walk()` calls a function for its side effects (such as drawing a plot) & silently returns its input (which is useful if we want to plot an intermediate data set in a series of operations that pipe into each other). The convenience here is that `purr::walk()` doesn't print any output to the console.
+
+```{r}
+par(mfrow = c(2, 3))
+plotTypes <- c('codes', 'changes', 'counts', 'quality', 'dist.neighbours', 'mapping')
+walk(plotTypes, ~plot(fleaSom, type = ., shape = 'straight'))
+```
+
+The resulting plots are shown above. The Codes plot is a fan plot representation of the weights for each node. Each segment of the fan represents the weight for a particular variable (as designated in the legend), & the distance the fan extends from the center represents the magnitude of its weight. This plot can help us to identify regions of the map that are associated with higher or lower values of particular variables.
+
+The Training Progress plot helps us to assess if we have included enough iterations while training the SOM. The x-axis shows the number of iterations (specified by the `rlen` argument), & the y-axis shows the mean distance between each case & its BMU at each iteration. We hope to see the profile of this plot flatten out before we reach our maximum number of iterations, which it seems to in this case. If we felt that the plot hadn't leveled out yet, we could increase the number of iterations.
+
+The Counts plot is a heatmap showing the number of cases assigned to each node. In this plot, we're looking to be sure we don't have lots of empty nodes (suggesting the map is too big) & that we have a reasonably even distribution of cases across the map. If we had lots of cases piled up at the edges, we might consider increasing the map dimensions or training a toroidal map instead.
+
+The Quality plot shows the mean distance between each case & the weights of its BMU. The lower this value is, the better.
+
+The Neighbour Distance plot shows the sum of distances between cases in one node & cases in the neighbouring nodes. We'll sometimes see this referred to as a `U matrix plot`, & it can be useful in identifying clusters of cases on the map. Because cases on the edge of a cluster of nodes have a greated distance to cases in a adjacent cluster of regions of the map (potential clusters) separated by light regions. It's difficult to interpret a map as small as this, but it appears as though we may have clusters on the left & right edges, & possibly a cluster at the top center.
+
+Finally, the Mapping plot shows the distribution of cases among the nodes. Not that the position of a case within a node doesn't mean anything -- they are just *dodged* (moved a small, random distance) so they don't sit on top of each other.
+
+The Codes plot is a useful way to visualise the weights of each node, but it becomes difficult to read when we have many variables, & it doesn't give an interpretable indication of magnitude. Instead, we prefer to create heatmaps: one for each variable. We use the `getCodes()` function to extract the weights for each node, where each row is a node & each volume is a variable, & convert this into a tibble. The following shows how to create a separate heatmap for each variable, this time using `iwalk()` to iterate over each of the columns.
+
+We set the `type` argument equal to `'property'`, which allows us to colour each node by some numerical property. We then use the `property` argument to tell the function exactly what property we want to plot. To set the title of each plot equal to the name of the variable it displays, we set the `main` argument equal to `.y` (hence why we chose `iwalk()` instead of `walk()`).
+
+```{r}
+getCodes(fleaSom) %>%
+  as_tibble() %>%
+  iwalk(~plot(fleaSom, type = 'property', property = .,
+              main = .y, shape = 'straight'))
+```
+
+The resulting plot is shown above. The heatmaps show very different patterns of weights for each of the variables. Nodes on the right side of the map have higher weights for the `tars1` & `aede2` variables & lower weights for the `aede3` variable (which is lowest in the bottom-right corner of the map). Nodes in the upper-left corner of the map have higher weights for the `tars2`, `head`, & `aede1` variables. Because the variables were scaled before training the SOM, the heatmap scales are in standard deviation units for each variable.
+
+Because we have some class information about our fleas, let's plot our SOM, colouring each case by its species.
+
+First, we define a vector of colours to use to distinguish the classes from each other. Then, we create a mapping plot using the `plot()` function, & using the `type = 'mapping'` argument. We set the `pch = 21` argument to use a filled circle to indicate each case (so we can set a background colour for each species). The `bg` argument sets the background colour of the points. By converting the `species` variable into a numeric vector & using it to subset the colour vector, each point will have a background colour corresponding to its species. Finally, we use the `shape` argument to draw hexagons instead of circles, & set the background colour (`bgcol`) equal to `'lightgrey'`.
+
+```{r}
+par(mfrow = c(1, 2))
+nodeCols <- c('cyan3', 'yellow', 'purple')
+plot(fleaSom, type = 'mapping', pch = 21,
+     bg = nodeCols[as.numeric(fleaTib$species)],
+     shape = 'straight', bgcol = 'lightgrey')
+```
+
+The resulting plot is shown above. We can see that the SOM has arranged itself such that fleas form the same species (that are more similar to each other than fleas from other species) are assigned to nodes near cases of the same species.
+
+
+### Mapping New Data onto the SOM
+
+We'll create two new cases with all of the continuous variables in the data we used to train the SOM.
+
+Once we define the tibble, we pipe it into the `scale()` function, because we trained the SOM on scaled data. But here's the really important part: a common mistake is to scale the new data by subtracting its own mean & dividing by its own standard deviation. This will likely lead to incorrect mapping, because we need to subtract the mean & divide by the standard deviation *of the training set*. Fortunately, these values are stored as attributes of the scaled data set, & we can access them using the `attr()` function.
+
+We use the `predict()` function with the SOM object as the first argument & the new, scaled data as the second argument, to map the new data onto our SOM. We can then plot the position of the new data on the map using the `plot()` function, supplying the `type = 'mapping'` argument. The `classif` argument allows us to specify an object returned by the `predict()` function, to draw only the new data. This time, we use the argument `shape = 'round'` to show what the circular nodes look like.
+
+```{r}
+newData <- tibble(tars1 = c(120, 200),
+                  tars2 = c(125, 120),
+                  head = c(52, 48),
+                  aede1 = c(140, 128),
+                  aede2 = c(12, 14),
+                  aede3 = c(100, 85)) %>%
+  scale(center = attr(fleaScaled, 'scaled:center'),
+        scale = attr(fleaScaled, 'scaled:scale'))
+predicted <- predict(fleaSom, newData)
+par(mfrow = c(1, 1))
+plot(fleaSom, type = 'mapping', classif = predicted, shape = 'round')
+```
+
+The resulting plot is shown above. Each case is placed in a separate node whose weights best represent the case's variable values. Look back at the previous figures to see what can be inferred about these two cases based on their position on the map.

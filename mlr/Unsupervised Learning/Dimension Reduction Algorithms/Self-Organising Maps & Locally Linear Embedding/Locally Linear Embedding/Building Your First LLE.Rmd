@@ -1,0 +1,172 @@
+---
+title: "Building Your First LLE"
+author: "Jie Heng Yu"
+date: "6/22/2023"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+library(tidyverse)
+library(mlr)
+library(rgl)
+```
+
+
+# Building Your First LLE
+
+For this lesson, we will show how to use the LLE algorithm to reduce the dimensions of a data set into a two-dimensional map. We'll start with an unusual example that really shows off the power of LLE as a nonlinear dimension-reduction algorithm. This example is unusual because it represents data shaped in a three-dimensional *S* that is unlike something we're likely to encounter in the real world. We'll then use LLE to create a two-dimensional embedding of our flea circus data to see how it compares to the SOM we created earlier.
+
+
+### Loading & Exploring the S-curve Data Set
+
+We'll load the lle_scurve_data data set from the lle package (no longer available on CRAN, read through csv), give names to its variables, & convert it into a tibble. We have a tibble containing 800 cases & 3 variables.
+
+```{r}
+sTib <- as_tibble(read.csv('lle_scurve_data.csv'))
+colnames(sTib) <- c('x', 'y', 'z')
+sTib
+```
+
+The data set consists of cases that are folded into the shape of the letter S in three dimensions. We'll create a 3 dimensional plot to visualise this, using the rgl package.
+
+```{r}
+plot3d(x = sTib$x, y = sTib$y, z = sTib$z, type = 's', radius = 0.1)
+rglwidget()
+```
+
+The `plot3d()` function allows us to create a three-dimensional plot & the `rglwidget()` function displays the plot onto an R markdown document. Here are a summary of the arguments to `plot3d()`:
+
+* `x`, `y` & `z` - Which variables to plot on their respective axes.
+* `type` - Letter indicating type of item to plot ('p' for points, 's' for spheres, 'l' for lines)
+* `radius` - The radius of spheres
+
+The resulting plot is shown above. One can see that the data forms a 3 dimensional S. This is an unusual data set for sure, but it will demonstrate the power of LLE for learning the manifold that underlies a data set.
+
+
+### Training the LLE
+
+Aside from the number of dimensions to which we want to reduce our data set (usually two or three), *k* is the only hyperparameter we need to select. We can choose the best-performing value of *k* by using the `calc_k()` function. This function applies the LLE algorithm to our data, using different values of *k* in a range we specify. For each embedding that uses a different *k*, `calc_k()` calculates the distances between cases in the original data & in the low-dimensional representation. The correlation coefficient between these distances is calculated ($\rho$, or 'rho') & used to calculate a metric $(1 - \rho^2)$ that can be used to select *k*. The value of *k* with the smallest value for this metric is the one that best preserves the distances between cases in the high- & low-dimensional representations.
+
+Here's a summary of the arguments of `calc_k()`:
+
+* The first argument is the data set.
+* The `m` argument is the number of dimensions we want to reduce our data set into.
+* The `kmin` & `kmax` arguments specify the minimum & maximum values of the range of *k* values the function will use.
+* The `parallel` argument specifies whether we want to parallelise this operation.
+* The `cpus` argument lets specify the number of cores we want to use for parallelisation. We'll use `parallel::detectCores()` to use all but one of our cores.
+
+The `calc_k()` function also returns a data frame containing the $1 - \rho^2$ metric for each value of *k*. We use the `filter()` function to select the row containing the lowest value of the `rho` column. We will use the value of *k* that corresponds with the smallest `rho` to train our final LLE.
+
+Finally, we run the LLE algorithm using the `lle()` function, supplying the following:
+
+* The data as the first argument
+* The number of dimensions we want to embed into as the *m* argument
+* The value of the *k* hyperparameter
+
+```{r}
+lleK <- calc_k(lle_scurve_data, m = 2, kmin = 1, kmax = 20,
+               parallel = TRUE, cpus = parallel::detectCores() - 1)
+lleBestK <- filter(lleK, rho == min(lleK$rho))
+lleBestK
+
+lleCurve <- lle(scurve_data, m = 2, k = lleBestK$k)
+```
+
+
+### Plotting the LLE Result
+
+Now that we've performed our embedding, we'll extract the two new LLE axes & plot the data onto them. This will allow use to visualise our data in a new 2 dimensional space to see if the algorithm has revealed a grouping structure.
+
+We start by mutating two new columns onto our original tibble, each containing the values of one of the LLE axes. We then use the `ggplot()` function to plot the two LLE axes against each other, mapping the *z* variable to the colour aesthetic. We add the `geom_point()` layer & a `scale_colour_gradient()` layer that specifies the extreme colours of a colour scale that will be mapped into the *z* variable. This will allow us to directly compare the position of each case in our new 2 dimensional representation to its position in the 3 dimensional plot before.
+
+```{r}
+sTib <- sTib %>%
+  mutate(LLE1 = lleCurve$Y[, 1],
+         LLE2 = lleCurve$y[, 2])
+
+ggplot(sTib, aes(LLE1, LLE2, col = z)) +
+  geom_point() + 
+  scale_colour_gradient(low = 'darkred', high = 'lightblue') +
+  theme_bw()
+```
+
+The resulting plot is shown above. We can see that the LLE has flattened out the *S* shape into a flat, two-dimenisonal rectangle of points. It's as if the data had been drawn onto a folded piece of paper, & LLE straightened it out! This is the power of manifold-learning algorithms for dimension reduction.
+
+
+***
+
+
+# Building an LLE of our Flea Data
+
+One criticism that is sometimes leveled at LLE is that it is designed to handle 'toy data' -- in other words, data that is constructed to form interesting & unusual shapes, but which rarely (if ever) manifests in real-world data sets. The S-curve data is an example of toy data that is generated to test algorithms that learn a manifold that the data lies on. As such, we're going to see how well LLE performs on our flea circus data set, & whether it can identify the clusters of fleas like our SOM could.
+
+```{r}
+data(flea)
+fleaTib <- as_tibble(flea)
+fleaScaled <- fleaTib %>%
+  select(-species) %>%
+  scale()
+```
+
+We're going to follow the same procedure as for the S-curve data set:
+
+1. Use the `calc_k()` to calculate the best-performing value of *k*.
+2. Performing the embedding in two dimensions.
+3. Plot the two new LLE axes against each other.
+
+This time, we'll map the `species` variable to the colour aesthetic, to see how well our LLE embedding separates the clusters.
+
+```{r}
+lleFleaK <- calc_k(fleaScaled, m = 2, kmin = 1, kmax = 20, 
+                   parallel = TRUE, cpus = parallel::detectCores() - 1)
+lleBestK <- filter(lleFleaK, rho == min(lleFleaK$rho))
+lleBestFleaK
+
+lleFlea <- lle(fleaSclaed, m = 2, k = lleBestFleaK$k)
+
+fleaTib <- fleaTib %>%
+  mutate(LLE1 = lleFlea$Y[, 1],
+         LLE2 = lleFlea$y[, 2])
+ggplot(fleaTib, aes(LLE1, LLE2, col = species)) + 
+  geom_point() + 
+  theme_bw()
+```
+
+**Note: Sadly, because each case is reconstructed as a weighted sum of its neighbours, new data cannot be projected onto an LLE map. For this reason, LLE cannot be easily used as a preprocessing step for other machine learning algorithms, as new data cannot be passed through it.**
+
+
+***
+
+
+# Strengths & Weaknesses of SOMs & LLE
+
+The strengths of SOMs & LLE are as follows:
+
+* They are both nonlinear dimension reduction algorithms, & so can reveal patterns in the data where linear algorithms like PCA may fail.
+* New data can be mapped onto an existing SOM.
+* They are reasonably inexpensive to train.
+* Rerunning the LLE algorithm on the same data set with the same value of *k* will always produce the same embedding.
+
+The weaknesses of SOMs & LLE are as follows:
+
+* They cannot natively handle categorical variables.
+* The lower-dimensional representations are not directly interpretable in terms of the original variables.
+* They are sensitive to data on different scales.
+* New data cannot be mapped onto an existing LLE.
+* They don't necessarily preserve the global structure of the data.
+* Rerunning the SOM algorithm on the same data set will produce a different map each time.
+* Small SOMs can be difficult to interpret, so the algorithm works best with large data sets (greater than hundreds of cases).
+
+
+***
+
+
+# Summary
+
+* SOMs create a grid/map of nodes to which cases in the data set are assigned.
+* SOMs learn patterns in the data by updating the weights of each node until the map converges to a set of weights that preserves similarities among the cases.
+* New data can be mapped onto an existing SOM, & SOM nodes can be clustered based on their weights.
+* LLE reconstructs each case as a linear weighted sum of its neighbours.
+* LLE then embeds the data in a lower dimensional feature space that preserves the weights.
+* LLE is excellent at learning complex manifolds that underlie a set of data, but new data cannot be mapped onto an existing embedding.
